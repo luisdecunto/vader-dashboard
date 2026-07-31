@@ -38,7 +38,71 @@ MEASURED_PROCESS_COLUMNS = ("force_g", "radial_Hencky_strain")
 VARIANT_COLUMN = "processing_variant"
 TRACE_COLUMN = "trace_id"
 LOG_Y_COLUMNS = {"extensional_viscosity_Pa_s"}
+VELOCITY_COLUMN = "velocity_mm_s"
+IFF_PALETTE = (
+    "#0075CF",
+    "#00A6A6",
+    "#6F52A2",
+    "#E69F00",
+    "#2E8B57",
+    "#56B4E9",
+    "#8C6D31",
+    "#6B7280",
+    "#C58AF9",
+    "#009E73",
+)
+COLUMN_DISPLAY_LABELS = {
+    "time_from_onset_s": "Time from onset",
+    "vertical_distance_L": "Vertical distance",
+    "radial_Hencky_strain": "HD strain",
+    "vertical_strain": "Vertical strain",
+    "D_over_D0": "D / D0",
+    "force_g": "Force",
+    "diameter_mm": "Diameter",
+    VELOCITY_COLUMN: "Velocity",
+    "area_mm2": "Area",
+    "stress_Pa": "Stress",
+    "surface_tension_stress_Pa": "Surface-tension stress",
+    "net_stress_Pa": "Net stress",
+    "hencky_strain": "HD strain (derived)",
+    "hencky_strain_rate_1_s": "HD strain rate",
+    "extensional_viscosity_Pa_s": "Extensional viscosity",
+}
+COLUMN_AXIS_SYMBOLS = {
+    "time_from_onset_s": "<i>t</i>",
+    "vertical_distance_L": "<i>L</i><sub>v</sub>",
+    "radial_Hencky_strain": "ε<sub>HD</sub>",
+    "vertical_strain": "ε<sub>z</sub>",
+    "D_over_D0": "<i>D</i>/<i>D</i><sub>0</sub>",
+    "force_g": "<i>F</i>",
+    "diameter_mm": "<i>D</i>",
+    VELOCITY_COLUMN: "<i>v</i>",
+    "area_mm2": "<i>A</i>",
+    "stress_Pa": "σ",
+    "surface_tension_stress_Pa": "σ<sub>γ</sub>",
+    "net_stress_Pa": "σ<sub>net</sub>",
+    "hencky_strain": "ε<sub>HD</sub>",
+    "hencky_strain_rate_1_s": "ε̇<sub>HD</sub>",
+    "extensional_viscosity_Pa_s": "η<sub>E</sub>",
+}
 
+COLUMN_UNITS = {
+    "time_from_onset_s": "s",
+    "vertical_distance_L": "-",
+    "radial_Hencky_strain": "-",
+    "vertical_strain": "-",
+    "D_over_D0": "-",
+    "force_g": "g",
+    "diameter_mm": "mm",
+    VELOCITY_COLUMN: "mm s<sup>-1</sup>",
+    "area_mm2": "mm<sup>2</sup>",
+    "stress_Pa": "Pa",
+    "surface_tension_stress_Pa": "Pa",
+    "net_stress_Pa": "Pa",
+    "hencky_strain": "-",
+    "hencky_strain_rate_1_s": "s<sup>-1</sup>",
+    "extensional_viscosity_Pa_s": "Pa s",
+}
 
 @dataclass(frozen=True)
 class PhysicalSettings:
@@ -100,6 +164,11 @@ class PlotRequest:
     force_variants: tuple[FormulaVariant, ...]
     strain_variants: tuple[FormulaVariant, ...]
     show_raw_overlay: bool
+    show_legend: bool
+    x_scale: str
+    y_scale: str
+    selected_materials: tuple[str, ...]
+    selected_velocities: tuple[str, ...]
     physical_settings: PhysicalSettings
 
 
@@ -110,6 +179,11 @@ class SummaryRequest:
     y_column: str
     group_by: str
     bin_count: int
+    show_legend: bool
+    x_scale: str
+    y_scale: str
+    selected_materials: tuple[str, ...]
+    selected_velocities: tuple[str, ...]
     physical_settings: PhysicalSettings
 
 
@@ -121,7 +195,55 @@ class FrequencyRequest:
     peak_settings: tuple[float, float, int, int, int]
     individual_plot: str
     summary_plot: str
+    show_peaks: bool
+    show_legend: bool
+    individual_x_scale: str
+    individual_y_scale: str
+    summary_x_scale: str
+    summary_y_scale: str
+    selected_materials: tuple[str, ...]
+    selected_velocities: tuple[str, ...]
     physical_settings: PhysicalSettings
+
+
+def column_display_label(column: str) -> str:
+    return COLUMN_DISPLAY_LABELS.get(column, column)
+
+
+def column_axis_title(column: str) -> str:
+    symbol = COLUMN_AXIS_SYMBOLS.get(column, column)
+    unit = COLUMN_UNITS.get(column, "-")
+    return f"{symbol} [{unit}]"
+
+def formula_source_label(source_column: str) -> str:
+    return "HD" if source_column == "radial_Hencky_strain" else source_column
+
+
+def canonical_formula_source(source_name: str) -> str:
+    return "radial_Hencky_strain" if source_name.upper() == "HD" else source_name
+
+
+def parse_velocity_value(value: Any) -> float:
+    match = re.search(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", str(value))
+    return float(match.group(0)) if match else float("nan")
+
+
+def velocity_sort_key(value: Any) -> tuple[int, float, str]:
+    numeric = parse_velocity_value(value)
+    if np.isfinite(numeric):
+        return (0, numeric, str(value).casefold())
+    return (1, float("inf"), str(value).casefold())
+
+
+def sorted_velocity_values(values: Any) -> list[str]:
+    return sorted(
+        {str(value) for value in values if pd.notna(value)},
+        key=velocity_sort_key,
+    )
+
+
+def normalize_axis_scale(value: str) -> str:
+    return "log" if str(value).lower() == "log" else "linear"
 
 
 def parse_filter_workflow(expression: str) -> tuple[FilterStep, ...]:
@@ -196,7 +318,7 @@ def parse_filter_formula_list(
 ) -> tuple[FormulaVariant, ...]:
     formulas = split_formula_list(expression_text)
     if not formulas:
-        formulas = [source_column]
+        formulas = [formula_source_label(source_column)]
 
     variants: list[FormulaVariant] = []
     seen: set[str] = set()
@@ -204,8 +326,8 @@ def parse_filter_formula_list(
         expanded = expand_filter_formula_shorthand(expression, source_column)
         parsed_source, steps = parse_filter_formula(expanded)
         if parsed_source != source_column:
-            raise ValueError(f"Formula must start from {source_column}.")
-        normalized = format_filter_formula(source_column, steps)
+            raise ValueError(f"Formula must start from {column_display_label(source_column)}.")
+        normalized = format_filter_formula(formula_source_label(source_column), steps)
         if normalized in seen:
             continue
         seen.add(normalized)
@@ -259,7 +381,7 @@ def _parse_filter_formula_node(expression: str) -> tuple[str, tuple[FilterStep, 
     if outer is None:
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", expression):
             raise ValueError(f"Invalid source column '{expression}'.")
-        return expression, ()
+        return canonical_formula_source(expression), ()
 
     function_name, arguments_text = outer
     arguments = _split_formula_arguments(arguments_text)
@@ -791,7 +913,7 @@ def align_formula_variants(
         strain_variants = strain_variants * count
     if len(force_variants) != len(strain_variants):
         raise ValueError(
-            "Force and radial-strain formula lists must have the same length, "
+            "Force and HD-strain formula lists must have the same length, "
             "unless one list has only one formula."
         )
     return force_variants, strain_variants
@@ -1212,14 +1334,18 @@ REQUIRED_COLUMNS = [
 ]
 
 AVAILABLE_COLUMNS = REQUIRED_COLUMNS + DERIVED_COLUMNS
-METADATA_COLUMNS = ["material", "velocity", "sample", "source_file"]
+RAW_AXIS_COLUMNS = [*REQUIRED_COLUMNS, VELOCITY_COLUMN]
+PROCESSED_AXIS_COLUMNS = [*AVAILABLE_COLUMNS, VELOCITY_COLUMN]
+METADATA_COLUMNS = [
+    "material", "velocity", VELOCITY_COLUMN, "sample", "source_file"
+]
 RAW_DEFAULT_PLOTS = [
     {"x": "time_from_onset_s", "y": "force_g"},
     {"x": "time_from_onset_s", "y": "diameter_mm"},
 ]
 PROCESSED_DEFAULT_PLOTS = [
     {"x": "time_from_onset_s", "y": "force_g"},
-    {"x": "hencky_strain", "y": "net_stress_Pa"},
+    {"x": "radial_Hencky_strain", "y": "net_stress_Pa"},
 ]
 
 
@@ -1259,14 +1385,14 @@ def main() -> None:
         with raw_content.container():
             render_dashboard(
                 file_summary, signature, physical_settings,
-                "raw", REQUIRED_COLUMNS, RAW_DEFAULT_PLOTS,
+                "raw", RAW_AXIS_COLUMNS, RAW_DEFAULT_PLOTS,
                 allow_processing=False,
             )
     elif workspace == "Filtered / processed":
         with processed_content.container():
             render_dashboard(
                 file_summary, signature, physical_settings,
-                "processed", AVAILABLE_COLUMNS, PROCESSED_DEFAULT_PLOTS,
+                "processed", PROCESSED_AXIS_COLUMNS, PROCESSED_DEFAULT_PLOTS,
                 allow_processing=True,
             )
     elif workspace == "Frequency analysis":
@@ -1285,8 +1411,16 @@ def inject_styles() -> None:
             --vader-muted: #667085;
             --vader-border: #d9dee8;
             --vader-panel: #ffffff;
-            --vader-accent: #df3d4f;
+            --vader-accent: #0075CF;
             --vader-rail: 4rem;
+        }
+        button[data-testid="stBaseButton-primary"] {
+            background-color: var(--vader-accent);
+            border-color: var(--vader-accent);
+        }
+        button[data-testid="stBaseButton-primary"]:hover {
+            background-color: #005FA8;
+            border-color: #005FA8;
         }
         header[data-testid="stHeader"],
         [data-testid="stSidebar"],
@@ -1532,6 +1666,12 @@ def render_header(workspace: str) -> None:
 
 def set_workspace(workspace: str) -> None:
     st.session_state["workspace"] = workspace
+    st.session_state["_restore_scope"] = {
+        "Filtered / processed": "processed",
+        "Raw data": "raw",
+        "Frequency analysis": "frequency",
+        "Summary plots": "summary",
+    }[workspace]
 
 
 def render_navigation() -> str:
@@ -1601,6 +1741,7 @@ def render_physical_settings() -> PhysicalSettings:
                 "Crop strain",
                 ["radial_Hencky_strain", "vertical_strain"],
                 key="physics_crop_strain_column",
+                format_func=column_display_label,
             )
             crop_threshold = st.number_input(
                 "Crop threshold", value=7.0, key="physics_crop_threshold"
@@ -1623,7 +1764,7 @@ def render_physical_settings() -> PhysicalSettings:
             )
             st.caption(
                 "Stress = force / area. Net stress subtracts capillary stress. "
-                "Extensional viscosity = net stress / Hencky rate."
+                "Extensional viscosity = net stress / HD strain rate."
             )
     return PhysicalSettings(
         surface_tension_mN_m=float(surface_tension),
@@ -1658,12 +1799,13 @@ def load_file_summary(
                 "source_file": Path(path_text).name,
                 "material": metadata["material"],
                 "velocity": metadata["velocity"],
+                VELOCITY_COLUMN: parse_velocity_value(metadata["velocity"]),
                 "sample": metadata["sample"],
             }
         )
     return pd.DataFrame.from_records(
         records,
-        columns=["source_file", "material", "velocity", "sample"],
+        columns=["source_file", "material", "velocity", VELOCITY_COLUMN, "sample"],
     )
 
 
@@ -1699,6 +1841,7 @@ def load_selected_dataset(
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
         for key, value in metadata.items():
             frame[key] = value
+        frame[VELOCITY_COLUMN] = parse_velocity_value(metadata["velocity"])
         frames.append(frame)
 
     data = (
@@ -1738,6 +1881,7 @@ def load_dataset(
 
         for key, value in metadata.items():
             frame[key] = value
+        frame[VELOCITY_COLUMN] = parse_velocity_value(metadata["velocity"])
 
         frames.append(frame)
         file_records.append(
@@ -1745,6 +1889,7 @@ def load_dataset(
                 "source_file": path.name,
                 "material": metadata["material"],
                 "velocity": metadata["velocity"],
+                VELOCITY_COLUMN: parse_velocity_value(metadata["velocity"]),
                 "sample": metadata["sample"],
             }
         )
@@ -1756,7 +1901,7 @@ def load_dataset(
     )
     file_summary = pd.DataFrame.from_records(
         file_records,
-        columns=["source_file", "material", "velocity", "sample"],
+        columns=["source_file", "material", "velocity", VELOCITY_COLUMN, "sample"],
     )
     return data, file_summary, issues
 
@@ -1803,6 +1948,11 @@ def render_dashboard(
     default_plots: list[dict[str, str]],
     allow_processing: bool,
 ) -> None:
+    if st.session_state.get("_restore_scope") == scope:
+        for index in range(len(default_plots)):
+            restore_plot_controls(scope, index, file_summary, allow_processing)
+        st.session_state.pop("_restore_scope", None)
+
     plot_columns = st.columns(2, gap="small")
     for index, defaults in enumerate(default_plots):
         with plot_columns[index]:
@@ -1811,6 +1961,117 @@ def render_dashboard(
                 physical_settings, scope, axis_options, allow_processing,
             )
 
+
+def restore_selection_controls(
+    selector_scope: str,
+    file_summary: pd.DataFrame,
+    selected_files: tuple[str, ...],
+    selected_materials: tuple[str, ...],
+    selected_velocities: tuple[str, ...],
+) -> None:
+    material_set = set(selected_materials)
+    velocity_set = set(selected_velocities)
+    file_set = set(selected_files)
+    for material in file_summary["material"].dropna().astype(str).unique():
+        st.session_state[f"{selector_scope}_material_{material}"] = (
+            material in material_set
+        )
+    for velocity in file_summary["velocity"].dropna().astype(str).unique():
+        st.session_state[f"{selector_scope}_velocity_{velocity}"] = (
+            velocity in velocity_set
+        )
+    for source_file in file_summary["source_file"].astype(str):
+        st.session_state[f"plot_{selector_scope}_file_{source_file}"] = (
+            source_file in file_set
+        )
+
+
+def restore_plot_controls(
+    scope: str,
+    index: int,
+    file_summary: pd.DataFrame,
+    allow_processing: bool,
+) -> None:
+    key_prefix = f"{scope}_plot_{index}"
+    request = st.session_state.get(f"{key_prefix}_applied_request")
+    if request is None or not hasattr(request, "show_legend"):
+        return
+
+    st.session_state[f"{key_prefix}_x"] = request.x_column
+    st.session_state[f"{key_prefix}_y"] = request.y_column
+    st.session_state[f"{key_prefix}_show_legend"] = request.show_legend
+    st.session_state[f"{key_prefix}_x_scale"] = request.x_scale.title()
+    st.session_state[f"{key_prefix}_y_scale"] = request.y_scale.title()
+    st.session_state[f"{key_prefix}_scale_for_y"] = request.y_column
+    st.session_state[f"{key_prefix}_raw_overlay"] = request.show_raw_overlay
+    if allow_processing:
+        st.session_state[f"{key_prefix}_force_formula_list"] = "\n".join(
+            variant.expression for variant in request.force_variants
+        )
+        st.session_state[f"{key_prefix}_strain_formula_list"] = "\n".join(
+            variant.expression for variant in request.strain_variants
+        )
+    restore_selection_controls(
+        f"{scope}_{index}",
+        file_summary,
+        request.selected_files,
+        request.selected_materials,
+        request.selected_velocities,
+    )
+
+
+def render_plot_view_controls(
+    key_prefix: str,
+    y_column: str,
+    allow_raw_overlay: bool = False,
+) -> tuple[bool, bool, str, str]:
+    show_legend_key = f"{key_prefix}_show_legend"
+    raw_overlay_key = f"{key_prefix}_raw_overlay"
+    x_scale_key = f"{key_prefix}_x_scale"
+    y_scale_key = f"{key_prefix}_y_scale"
+    scale_for_y_key = f"{key_prefix}_scale_for_y"
+
+    st.session_state.setdefault(show_legend_key, True)
+    st.session_state.setdefault(raw_overlay_key, True)
+    st.session_state.setdefault(x_scale_key, "Linear")
+    if st.session_state.get(scale_for_y_key) != y_column:
+        st.session_state[y_scale_key] = "Log" if uses_log_y(y_column) else "Linear"
+        st.session_state[scale_for_y_key] = y_column
+    st.session_state.setdefault(y_scale_key, "Linear")
+
+    with st.popover("View", icon=":material/visibility:", width="stretch"):
+        if allow_raw_overlay:
+            show_raw_overlay = st.toggle(
+                "Raw background",
+                key=raw_overlay_key,
+                help="Show preprocessed raw data behind processed curves.",
+            )
+        else:
+            show_raw_overlay = False
+        show_legend = st.toggle("Legend", key=show_legend_key)
+        scale_columns = st.columns(2, gap="small")
+        with scale_columns[0]:
+            x_scale = st.segmented_control(
+                "X scale",
+                ["Linear", "Log"],
+                key=x_scale_key,
+                required=True,
+                width="stretch",
+            )
+        with scale_columns[1]:
+            y_scale = st.segmented_control(
+                "Y scale",
+                ["Linear", "Log"],
+                key=y_scale_key,
+                required=True,
+                width="stretch",
+            )
+    return (
+        bool(show_raw_overlay),
+        bool(show_legend),
+        normalize_axis_scale(str(x_scale)),
+        normalize_axis_scale(str(y_scale)),
+    )
 
 def render_plot_window(
     index: int,
@@ -1829,13 +2090,13 @@ def render_plot_window(
             f'<div class="plot-heading">Plot {index + 1}</div>',
             unsafe_allow_html=True,
         )
-        materials = sorted(file_summary["material"].dropna().unique().tolist())
-        velocities = sorted(file_summary["velocity"].dropna().unique().tolist())
+        materials = sorted(file_summary["material"].dropna().astype(str).unique())
+        velocities = sorted_velocity_values(file_summary["velocity"])
         force_variants = parse_filter_formula_list("force_g", "force_g")
-        strain_variants = parse_filter_formula_list(
-            "radial_Hencky_strain", "radial_Hencky_strain"
-        )
+        strain_variants = parse_filter_formula_list("HD", "radial_Hencky_strain")
         show_raw_overlay = False
+        st.session_state.setdefault(f"{key_prefix}_x", defaults["x"])
+        st.session_state.setdefault(f"{key_prefix}_y", defaults["y"])
 
         axis_toolbar = st.columns(
             [0.28, 1.35, 0.28, 1.35],
@@ -1846,23 +2107,29 @@ def render_plot_window(
             render_inline_label("X:")
         with axis_toolbar[1]:
             x_column = st.selectbox(
-                "X axis", axis_options,
-                index=get_option_index(axis_options, defaults["x"]),
-                key=f"{key_prefix}_x", label_visibility="collapsed",
+                "X axis",
+                axis_options,
+                index=None,
+                key=f"{key_prefix}_x",
+                label_visibility="collapsed",
+                format_func=column_display_label,
             )
         with axis_toolbar[2]:
             render_inline_label("Y:")
         with axis_toolbar[3]:
             y_column = st.selectbox(
-                "Y axis", axis_options,
-                index=get_option_index(axis_options, defaults["y"]),
-                key=f"{key_prefix}_y", label_visibility="collapsed",
+                "Y axis",
+                axis_options,
+                index=None,
+                key=f"{key_prefix}_y",
+                label_visibility="collapsed",
+                format_func=column_display_label,
             )
 
         selector_scope = f"{scope}_{index}"
         if allow_processing:
             option_toolbar = st.columns(
-                [1.15, 1.15, 1.05, 1.05, 0.7],
+                [1, 1, 1, 1, 1],
                 gap="small",
                 vertical_alignment="center",
             )
@@ -1872,7 +2139,7 @@ def render_plot_window(
                 )
             with option_toolbar[1]:
                 strain_variants = render_formula_variant_controls(
-                    f"{key_prefix}_strain", "Radial", "radial_Hencky_strain"
+                    f"{key_prefix}_strain", "HD", "radial_Hencky_strain"
                 )
             with option_toolbar[2]:
                 selected_materials = render_filter_dropdown(
@@ -1883,14 +2150,16 @@ def render_plot_window(
                     selector_scope, "Velocity", velocities
                 )
             with option_toolbar[4]:
-                show_raw_overlay = st.checkbox(
-                    "Raw",
-                    value=True,
-                    key=f"{key_prefix}_raw_overlay",
-                    help="Show preprocessed raw data behind processed curves.",
+                (
+                    show_raw_overlay,
+                    show_legend,
+                    x_scale,
+                    y_scale,
+                ) = render_plot_view_controls(
+                    key_prefix, str(y_column), allow_raw_overlay=True
                 )
         else:
-            filter_toolbar = st.columns(2, gap="small")
+            filter_toolbar = st.columns([1, 1, 0.9], gap="small")
             with filter_toolbar[0]:
                 selected_materials = render_filter_dropdown(
                     selector_scope, "Material", materials
@@ -1899,9 +2168,14 @@ def render_plot_window(
                 selected_velocities = render_filter_dropdown(
                     selector_scope, "Velocity", velocities
                 )
+            with filter_toolbar[2]:
+                _, show_legend, x_scale, y_scale = render_plot_view_controls(
+                    key_prefix, str(y_column)
+                )
+
         eligible_summary = file_summary[
-            file_summary["material"].isin(selected_materials)
-            & file_summary["velocity"].isin(selected_velocities)
+            file_summary["material"].astype(str).isin(selected_materials)
+            & file_summary["velocity"].astype(str).isin(selected_velocities)
         ]
         selection_columns = st.columns(
             [7.5, 0.65], gap="small", vertical_alignment="top"
@@ -1925,13 +2199,18 @@ def render_plot_window(
             force_variants=force_variants,
             strain_variants=strain_variants,
             show_raw_overlay=bool(show_raw_overlay),
+            show_legend=bool(show_legend),
+            x_scale=x_scale,
+            y_scale=y_scale,
+            selected_materials=tuple(selected_materials),
+            selected_velocities=tuple(selected_velocities),
             physical_settings=physical_settings,
         )
         if update_requested:
             st.session_state[applied_key] = draft_request
 
         applied_request = st.session_state.get(applied_key)
-        if applied_request is not None and not hasattr(applied_request, "selected_files"):
+        if applied_request is not None and not hasattr(applied_request, "show_legend"):
             applied_request = None
         if applied_request is None:
             st.info("No data series applied.")
@@ -1948,6 +2227,9 @@ def render_plot_window(
         force_variants = applied_request.force_variants
         strain_variants = applied_request.strain_variants
         show_raw_overlay = applied_request.show_raw_overlay
+        show_legend = applied_request.show_legend
+        x_scale = applied_request.x_scale
+        y_scale = applied_request.y_scale
         applied_physics = applied_request.physical_settings
 
         raw_data, issues = load_selected_dataset(
@@ -1965,7 +2247,13 @@ def render_plot_window(
                 st.info("No data matches the applied selection.")
                 return
             render_plot_figure(
-                plot_frame, x_column, y_column, y_column,
+                plot_frame,
+                x_column,
+                y_column,
+                y_column,
+                show_legend=show_legend,
+                x_scale=x_scale,
+                y_scale=y_scale,
                 download_key=f"{key_prefix}_raw",
             )
             return
@@ -1998,7 +2286,13 @@ def render_plot_window(
         )
         if not has_processing:
             render_plot_figure(
-                raw_plot_frame, x_column, y_column, y_column,
+                raw_plot_frame,
+                x_column,
+                y_column,
+                y_column,
+                show_legend=show_legend,
+                x_scale=x_scale,
+                y_scale=y_scale,
                 download_key=f"{key_prefix}_preprocessed",
             )
             return
@@ -2009,8 +2303,18 @@ def render_plot_window(
             tuple(selected_files), show_raw_overlay,
         )
         render_background_processed_plot(
-            job_key, preprocessed.frame, raw_plot_frame, x_column, y_column,
-            force_variants, strain_variants, applied_physics, show_raw_overlay,
+            job_key,
+            preprocessed.frame,
+            raw_plot_frame,
+            x_column,
+            y_column,
+            force_variants,
+            strain_variants,
+            applied_physics,
+            show_raw_overlay,
+            show_legend,
+            x_scale,
+            y_scale,
             download_key=f"{key_prefix}_processed",
         )
 
@@ -2021,7 +2325,7 @@ def render_inline_label(text: str) -> None:
     )
 
 def render_filter_dropdown(
-    index: int,
+    index: int | str,
     label: str,
     values: list[str],
 ) -> list[str]:
@@ -2089,7 +2393,7 @@ def render_formula_variant_controls(
 ) -> tuple[FormulaVariant, ...]:
     key = f"{scope}_formula_list"
     if key not in st.session_state:
-        st.session_state[key] = source_column
+        st.session_state[key] = formula_source_label(source_column)
 
     try:
         variants = parse_filter_formula_list(str(st.session_state[key]), source_column)
@@ -2120,7 +2424,7 @@ def render_formula_variant_controls(
             variants = parse_filter_formula_list(formula_text, source_column)
         except ValueError as exc:
             st.error(str(exc))
-            return parse_filter_formula_list(source_column, source_column)
+            return parse_filter_formula_list(formula_source_label(source_column), source_column)
         st.caption("Parsed: " + "; ".join(variant.label for variant in variants))
     return variants
 def render_processing_controls(
@@ -2131,14 +2435,14 @@ def render_processing_controls(
     formula_key = f"{scope}_filter_formula"
     source_key = f"{scope}_filter_source"
     if formula_key not in st.session_state:
-        st.session_state[formula_key] = source_column
+        st.session_state[formula_key] = formula_source_label(source_column)
     if st.session_state.get(source_key) != source_column:
         try:
             _, existing_steps = parse_filter_formula(st.session_state[formula_key])
         except ValueError:
             existing_steps = ()
         st.session_state[formula_key] = format_filter_formula(
-            source_column, existing_steps
+            formula_source_label(source_column), existing_steps
         )
         st.session_state[source_key] = source_column
 
@@ -2179,7 +2483,7 @@ def render_processing_controls(
             formula_valid = False
         else:
             if not formula_valid:
-                st.error(f"Formula must start from {source_column}.")
+                st.error(f"Formula must start from {column_display_label(source_column)}.")
             else:
                 st.caption(f"Applied order: {format_filter_workflow(workflow)}")
 
@@ -2307,10 +2611,27 @@ def update_filter_formula(
         steps = steps[:-1]
     elif action == "reset":
         steps = ()
-    st.session_state[formula_key] = format_filter_formula(parsed_source, steps)
+    st.session_state[formula_key] = format_filter_formula(formula_source_label(parsed_source), steps)
 
-def render_file_selector(index: int, file_summary: pd.DataFrame) -> list[str]:
-    files = file_summary["source_file"].tolist()
+def persist_control_value(widget_key: str, store_key: str) -> None:
+    st.session_state[store_key] = st.session_state.get(widget_key)
+
+
+def numerically_sorted_file_summary(file_summary: pd.DataFrame) -> pd.DataFrame:
+    if file_summary.empty:
+        return file_summary
+    ordered = file_summary.copy()
+    ordered["_velocity_sort"] = ordered["velocity"].map(parse_velocity_value)
+    ordered["_velocity_text"] = ordered["velocity"].astype(str).str.casefold()
+    return ordered.sort_values(
+        ["material", "_velocity_sort", "_velocity_text", "sample", "source_file"],
+        na_position="last",
+    ).drop(columns=["_velocity_sort", "_velocity_text"])
+
+
+def render_file_selector(index: int | str, file_summary: pd.DataFrame) -> list[str]:
+    ordered_summary = numerically_sorted_file_summary(file_summary)
+    files = ordered_summary["source_file"].tolist()
     for file_name in files:
         key = f"plot_{index}_file_{file_name}"
         if key not in st.session_state:
@@ -2320,31 +2641,53 @@ def render_file_selector(index: int, file_summary: pd.DataFrame) -> list[str]:
         bool(st.session_state[f"plot_{index}_file_{file_name}"])
         for file_name in files
     )
+    panel_key = f"plot_{index}_data_panel_open"
+    panel_store_key = f"keep_{panel_key}"
+    if panel_key not in st.session_state:
+        st.session_state[panel_key] = bool(
+            st.session_state.get(panel_store_key, False)
+        )
+    panel_open = st.toggle(
+        f"Data series  {selected_count}/{len(files)}",
+        key=panel_key,
+        on_change=persist_control_value,
+        args=(panel_key, panel_store_key),
+    )
 
-    with st.expander(f"Data series  {selected_count}/{len(files)}", expanded=False):
-        action_columns = st.columns([1, 1, 4], gap="small")
-        if action_columns[0].button("All", key=f"plot_{index}_all", width="stretch"):
-            set_file_selection(index, files, True)
-            st.rerun()
-        if action_columns[1].button("None", key=f"plot_{index}_none", width="stretch"):
-            set_file_selection(index, files, False)
-            st.rerun()
+    selected_files: list[str] = []
+    if panel_open:
+        with st.container(border=True):
+            action_columns = st.columns([1, 1, 4], gap="small")
+            if action_columns[0].button(
+                "All", key=f"plot_{index}_all", width="stretch"
+            ):
+                set_file_selection(index, files, True)
+                st.rerun()
+            if action_columns[1].button(
+                "None", key=f"plot_{index}_none", width="stretch"
+            ):
+                set_file_selection(index, files, False)
+                st.rerun()
 
-        checkbox_columns = st.columns(3, gap="small")
-        selected_files: list[str] = []
-        for file_index, row in file_summary.reset_index(drop=True).iterrows():
-            file_name = row["source_file"]
-            label = get_file_label(row)
-            with checkbox_columns[file_index % len(checkbox_columns)]:
-                if st.checkbox(
-                    label,
-                    key=f"plot_{index}_file_{file_name}",
-                    help=file_name,
-                ):
-                    selected_files.append(file_name)
+            checkbox_columns = st.columns(3, gap="small")
+            for file_index, row in ordered_summary.reset_index(drop=True).iterrows():
+                file_name = row["source_file"]
+                label = get_file_label(row)
+                with checkbox_columns[file_index % len(checkbox_columns)]:
+                    if st.checkbox(
+                        label,
+                        key=f"plot_{index}_file_{file_name}",
+                        help=file_name,
+                    ):
+                        selected_files.append(file_name)
+    else:
+        selected_files = [
+            file_name
+            for file_name in files
+            if st.session_state[f"plot_{index}_file_{file_name}"]
+        ]
 
     return selected_files
-
 
 def set_file_selection(index: int | str, files: list[str], selected: bool) -> None:
     for file_name in files:
@@ -2400,6 +2743,9 @@ def render_background_processed_plot(
     strain_variants: tuple[FormulaVariant, ...],
     physical_settings: PhysicalSettings,
     show_raw_overlay: bool,
+    show_legend: bool,
+    x_scale: str,
+    y_scale: str,
     download_key: str,
 ) -> None:
     future = submit_background_job(
@@ -2415,7 +2761,15 @@ def render_background_processed_plot(
             result: ProcessedFrame = future.result()
         except Exception as exc:  # pragma: no cover
             st.error(f"Processing failed: {exc}")
-            render_plot_figure(raw_plot_frame, x_column, y_column, y_column)
+            render_plot_figure(
+                raw_plot_frame,
+                x_column,
+                y_column,
+                y_column,
+                show_legend=show_legend,
+                x_scale=x_scale,
+                y_scale=y_scale,
+            )
             return
         processed_plot_frame = build_plot_frame(result.frame, x_column, y_column)
         if processed_plot_frame.empty:
@@ -2427,6 +2781,9 @@ def render_background_processed_plot(
             y_column,
             y_column,
             raw_plot_frame if show_raw_overlay else None,
+            show_legend=show_legend,
+            x_scale=x_scale,
+            y_scale=y_scale,
             download_key=download_key,
         )
         render_processing_notes(result)
@@ -2437,62 +2794,38 @@ def render_background_processed_plot(
         if future.done():
             st.rerun()
         st.caption("Processing selected data in background...")
-        render_plot_figure(raw_plot_frame, x_column, y_column, y_column)
+        render_plot_figure(
+            raw_plot_frame,
+            x_column,
+            y_column,
+            y_column,
+            show_legend=show_legend,
+            x_scale=x_scale,
+            y_scale=y_scale,
+        )
 
     pending_processed_plot()
-def render_background_plot(
-    job_key: str,
-    plot_frame: pd.DataFrame,
+
+
+def prepare_frame_for_axis_scales(
+    frame: pd.DataFrame,
     x_column: str,
     y_column: str,
-    x_settings: FilterSettings,
-    y_settings: FilterSettings,
-) -> None:
-    if not x_settings.active and not y_settings.active:
-        render_plot_figure(plot_frame, x_column, y_column, y_column)
-        return
-
-    future = submit_background_job(
-        job_key,
-        process_axes_frame,
-        plot_frame,
-        x_column,
-        x_settings,
-        y_column,
-        y_settings,
-    )
-    if future.done():
-        try:
-            result: ProcessedFrame = future.result()
-        except Exception as exc:  # pragma: no cover
-            st.error(f"Processing failed: {exc}")
-            render_plot_figure(plot_frame, x_column, y_column, y_column)
-            return
-        plot_x_column = (
-            f"{x_column}__x_processed" if x_settings.active else x_column
-        )
-        plot_y_column = (
-            f"{y_column}__y_processed" if y_settings.active else y_column
-        )
-        render_plot_figure(
-            result.frame,
-            plot_x_column,
-            plot_y_column,
-            y_column,
-            x_label=x_column,
-        )
-        render_processing_notes(result)
-        return
-
-    @st.fragment(run_every=0.75)
-    def pending_plot() -> None:
-        if future.done():
-            st.rerun()
-        st.caption("Processing in background...")
-        render_plot_figure(plot_frame, x_column, y_column, y_column)
-
-    pending_plot()
-
+    x_scale: str,
+    y_scale: str,
+) -> pd.DataFrame:
+    x_log = normalize_axis_scale(x_scale) == "log"
+    y_log = normalize_axis_scale(y_scale) == "log"
+    if not x_log and not y_log:
+        return frame
+    prepared = frame.copy()
+    if x_log and x_column in prepared.columns:
+        x_values = pd.to_numeric(prepared[x_column], errors="coerce")
+        prepared[x_column] = x_values.where(x_values > 0)
+    if y_log and y_column in prepared.columns:
+        y_values = pd.to_numeric(prepared[y_column], errors="coerce")
+        prepared[y_column] = y_values.where(y_values > 0)
+    return prepared
 
 
 def render_processed_plot_figure(
@@ -2502,16 +2835,33 @@ def render_processed_plot_figure(
     y_label: str,
     raw_frame: pd.DataFrame | None = None,
     x_label: str | None = None,
+    show_legend: bool = True,
+    x_scale: str = "linear",
+    y_scale: str = "linear",
     download_key: str | None = None,
 ) -> None:
     figure = make_processed_figure(
-        frame, x_column, y_column, y_label, raw_frame, x_label
+        frame,
+        x_column,
+        y_column,
+        y_label,
+        raw_frame,
+        x_label,
+        show_legend,
+        x_scale,
+        y_scale,
     )
     st.plotly_chart(figure, width="stretch", config=plotly_config())
     if download_key is not None:
         render_plot_download(
-            frame, x_column, y_column, download_key,
-            primary_kind="processed", raw_frame=raw_frame,
+            frame,
+            x_column,
+            y_column,
+            download_key,
+            primary_kind="processed",
+            raw_frame=raw_frame,
+            x_scale=x_scale,
+            y_scale=y_scale,
         )
 
 
@@ -2522,12 +2872,18 @@ def make_processed_figure(
     y_label: str,
     raw_frame: pd.DataFrame | None = None,
     x_label: str | None = None,
+    show_legend: bool = True,
+    x_scale: str = "linear",
+    y_scale: str = "linear",
 ) -> go.Figure:
-    log_y = uses_log_y(y_label)
-    plot_frame = prepare_y_for_plot_scale(plot_frame, y_column, log_y)
+    plot_frame = prepare_frame_for_axis_scales(
+        plot_frame, x_column, y_column, x_scale, y_scale
+    )
     plot_frame = add_series_labels(plot_frame)
     if raw_frame is not None:
-        raw_frame = prepare_y_for_plot_scale(raw_frame, y_column, log_y)
+        raw_frame = prepare_frame_for_axis_scales(
+            raw_frame, x_column, y_column, x_scale, y_scale
+        )
     figure = go.Figure()
     if raw_frame is not None and not raw_frame.empty:
         for _, group in raw_frame.groupby("source_file", sort=False, dropna=False):
@@ -2538,18 +2894,17 @@ def make_processed_figure(
                     y=ordered[y_column],
                     mode="lines",
                     line={"color": "rgba(90, 96, 110, 0.28)", "width": 1.0},
-                    name="raw",
+                    name="Raw",
                     showlegend=False,
                     hoverinfo="skip",
                 )
             )
 
-    palette = px.colors.qualitative.Safe
     source_values = (
         plot_frame["source_file"].astype(str).drop_duplicates().tolist()
     )
     source_colors = {
-        source_file: palette[index % len(palette)]
+        source_file: IFF_PALETTE[index % len(IFF_PALETTE)]
         for index, source_file in enumerate(source_values)
     }
     variant_dashes = ("solid", "dash", "dot", "dashdot", "longdash")
@@ -2561,7 +2916,6 @@ def make_processed_figure(
     trace_columns = ["source_file"]
     if VARIANT_COLUMN in plot_frame.columns:
         trace_columns.append(VARIANT_COLUMN)
-    trace_count = len(plot_frame[trace_columns].drop_duplicates())
     for variant_index, variant in enumerate(variant_values):
         variant_frame = (
             plot_frame[plot_frame[VARIANT_COLUMN] == variant]
@@ -2588,7 +2942,7 @@ def make_processed_figure(
                     line={"color": color, "width": 1.75, "dash": dash},
                     name=trace_name,
                     legendgroup=str(source_file),
-                    showlegend=trace_count > 1,
+                    showlegend=show_legend,
                     customdata=np.stack(
                         [
                             ordered["material"].astype(str),
@@ -2602,29 +2956,43 @@ def make_processed_figure(
                     hovertemplate=(
                         "%{customdata[3]}<br>"
                         "%{customdata[4]}<br>"
-                        f"{x_label or x_column}: %{{x:.4g}}<br>"
-                        f"{y_label}: %{{y:.4g}}<extra></extra>"
+                        f"{column_display_label(x_label or x_column)}: %{{x:.4g}}<br>"
+                        f"{column_display_label(y_label)}: %{{y:.4g}}<extra></extra>"
                     ),
                 )
             )
 
     figure.update_layout(
-        height=650, margin={"l": 8, "r": 8, "t": 15, "b": 8},
-        paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
-        showlegend=trace_count > 1,
-        hovermode="closest", font={"color": "#344054", "size": 11},
+        height=650,
+        margin={"l": 8, "r": 8, "t": 15, "b": 8},
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        showlegend=show_legend,
+        hovermode="closest",
+        font={"color": "#344054", "size": 11},
         legend={"orientation": "h", "y": 1.02, "x": 0, "font": {"size": 9}},
     )
-    figure.update_xaxes(title=x_label or x_column)
-    figure.update_yaxes(title=y_label, type="log" if log_y else "linear")
+    figure.update_xaxes(
+        title=column_axis_title(x_label or x_column),
+        type=normalize_axis_scale(x_scale),
+    )
+    figure.update_yaxes(
+        title=column_axis_title(y_label),
+        type=normalize_axis_scale(y_scale),
+    )
     style_axes(figure)
     return figure
+
+
 def render_plot_figure(
     frame: pd.DataFrame,
     x_column: str,
     plot_y_column: str,
     y_label: str,
     x_label: str | None = None,
+    show_legend: bool = True,
+    x_scale: str = "linear",
+    y_scale: str = "linear",
     download_key: str | None = None,
 ) -> None:
     figure = make_figure(
@@ -2633,12 +3001,20 @@ def render_plot_figure(
         plot_y_column,
         y_label,
         x_label=x_label,
+        show_legend=show_legend,
+        x_scale=x_scale,
+        y_scale=y_scale,
     )
     st.plotly_chart(figure, width="stretch", config=plotly_config())
     if download_key is not None:
         render_plot_download(
-            frame, x_column, plot_y_column, download_key,
+            frame,
+            x_column,
+            plot_y_column,
+            download_key,
             primary_kind="raw",
+            x_scale=x_scale,
+            y_scale=y_scale,
         )
 
 
@@ -2649,6 +3025,8 @@ def render_plot_download(
     download_key: str,
     primary_kind: str,
     raw_frame: pd.DataFrame | None = None,
+    x_scale: str = "linear",
+    y_scale: str = "linear",
 ) -> None:
     pieces: list[pd.DataFrame] = []
     for trace_kind, source in (
@@ -2657,12 +3035,12 @@ def render_plot_download(
     ):
         if source is None or source.empty:
             continue
-        prepared = prepare_y_for_plot_scale(
-            source, y_column, uses_log_y(y_column)
+        prepared = prepare_frame_for_axis_scales(
+            source, x_column, y_column, x_scale, y_scale
         ).dropna(subset=[x_column, y_column])
         columns = [
             column for column in (
-                "source_file", "material", "velocity", "sample",
+                "source_file", "material", "velocity", VELOCITY_COLUMN, "sample",
                 VARIANT_COLUMN, x_column, y_column,
             )
             if column in prepared.columns
@@ -2684,7 +3062,6 @@ def render_plot_download(
         help="Download the full-resolution data currently shown in this plot.",
         width="content",
     )
-
 
 def render_processing_notes(result: ProcessedFrame) -> None:
     selected_peaks = sorted({
@@ -2708,36 +3085,54 @@ def make_figure(
     y_column: str,
     y_label: str,
     x_label: str | None = None,
+    show_legend: bool = True,
+    x_scale: str = "linear",
+    y_scale: str = "linear",
 ) -> Any:
-    log_y = uses_log_y(y_label)
-    plot_frame = prepare_y_for_plot_scale(plot_frame, y_column, log_y)
+    plot_frame = prepare_frame_for_axis_scales(
+        plot_frame, x_column, y_column, x_scale, y_scale
+    )
     plot_frame = add_series_labels(plot_frame)
-    trace_count = plot_frame["source_file"].nunique()
     figure = px.line(
-        plot_frame, x=x_column, y=y_column, color="series_label",
+        plot_frame,
+        x=x_column,
+        y=y_column,
+        color="series_label",
         line_group="source_file",
+        color_discrete_sequence=IFF_PALETTE,
         hover_data={
-            "material": True, "velocity": True, "sample": True,
+            "material": True,
+            "velocity": True,
+            "sample": True,
             "source_file": True,
         },
         labels={
-            x_column: x_label or x_column,
-            y_column: y_label,
-            "series_label": "data series",
+            x_column: column_axis_title(x_label or x_column),
+            y_column: column_axis_title(y_label),
+            "series_label": "Data series",
         },
     )
     figure.update_layout(
-        height=650, margin={"l": 8, "r": 8, "t": 15, "b": 8},
-        paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
-        showlegend=trace_count > 1,
-        hovermode="closest", font={"color": "#344054", "size": 11},
+        height=650,
+        margin={"l": 8, "r": 8, "t": 15, "b": 8},
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        showlegend=show_legend,
+        hovermode="closest",
+        font={"color": "#344054", "size": 11},
         legend={"orientation": "h", "y": 1.02, "x": 0, "font": {"size": 9}},
     )
     style_axes(figure)
-    figure.update_yaxes(type="log" if log_y else "linear")
+    figure.update_xaxes(
+        title=column_axis_title(x_label or x_column),
+        type=normalize_axis_scale(x_scale),
+    )
+    figure.update_yaxes(
+        title=column_axis_title(y_label),
+        type=normalize_axis_scale(y_scale),
+    )
     figure.update_traces(line={"width": 1.6})
     return figure
-
 
 def add_series_labels(frame: pd.DataFrame) -> pd.DataFrame:
     labeled = frame.copy()
@@ -2821,14 +3216,39 @@ def submit_background_job(
 def make_job_key(*parts: Any) -> str:
     return hashlib.sha256(repr(parts).encode("utf-8")).hexdigest()
 
+def restore_summary_controls(file_summary: pd.DataFrame) -> None:
+    request = st.session_state.get("summary_applied_request")
+    if request is None or not hasattr(request, "show_legend"):
+        return
+    st.session_state["summary_x"] = request.x_column
+    st.session_state["summary_y"] = request.y_column
+    st.session_state["summary_group_by"] = request.group_by
+    st.session_state["summary_bins"] = request.bin_count
+    st.session_state["summary_show_legend"] = request.show_legend
+    st.session_state["summary_x_scale"] = request.x_scale.title()
+    st.session_state["summary_y_scale"] = request.y_scale.title()
+    st.session_state["summary_scale_for_y"] = request.y_column
+    restore_selection_controls(
+        "summary",
+        file_summary,
+        request.selected_files,
+        request.selected_materials,
+        request.selected_velocities,
+    )
+
+
 def render_summary_workspace(
     file_summary: pd.DataFrame,
     signature: tuple[tuple[str, int, int], ...],
     physical_settings: PhysicalSettings,
 ) -> None:
     applied_key = "summary_applied_request"
-    materials = sorted(file_summary["material"].dropna().unique().tolist())
-    velocities = sorted(file_summary["velocity"].dropna().unique().tolist())
+    if st.session_state.get("_restore_scope") == "summary":
+        restore_summary_controls(file_summary)
+        st.session_state.pop("_restore_scope", None)
+
+    materials = sorted(file_summary["material"].dropna().astype(str).unique())
+    velocities = sorted_velocity_values(file_summary["velocity"])
     filter_columns = st.columns(2, gap="small")
     with filter_columns[0]:
         selected_materials = render_filter_dropdown(
@@ -2840,34 +3260,51 @@ def render_summary_workspace(
         )
 
     eligible = file_summary[
-        file_summary["material"].isin(selected_materials)
-        & file_summary["velocity"].isin(selected_velocities)
+        file_summary["material"].astype(str).isin(selected_materials)
+        & file_summary["velocity"].astype(str).isin(selected_velocities)
     ]
-    control_columns = st.columns([2, 2, 1.5, 1], gap="small")
+    st.session_state.setdefault("summary_x", "radial_Hencky_strain")
+    st.session_state.setdefault("summary_y", "net_stress_Pa")
+    st.session_state.setdefault("summary_group_by", "Material")
+    st.session_state.setdefault("summary_bins", 100)
+    control_columns = st.columns([1.7, 1.7, 1.35, 0.8, 0.75], gap="small")
     with control_columns[0]:
         x_column = st.selectbox(
-            "X axis", AVAILABLE_COLUMNS,
-            index=get_option_index(AVAILABLE_COLUMNS, "hencky_strain"),
+            "X axis",
+            PROCESSED_AXIS_COLUMNS,
+            index=None,
             key="summary_x",
+            format_func=column_display_label,
         )
     with control_columns[1]:
         y_column = st.selectbox(
-            "Y axis", AVAILABLE_COLUMNS,
-            index=get_option_index(AVAILABLE_COLUMNS, "net_stress_Pa"),
+            "Y axis",
+            PROCESSED_AXIS_COLUMNS,
+            index=None,
             key="summary_y",
+            format_func=column_display_label,
         )
     with control_columns[2]:
         group_by = st.selectbox(
             "Group by",
             ["Material", "Velocity", "Material + velocity"],
+            index=None,
             key="summary_group_by",
         )
     with control_columns[3]:
         with st.popover("Binning", width="stretch"):
             bin_count = st.number_input(
-                "Number of X bins", min_value=10, max_value=500,
-                value=100, step=10, key="summary_bins",
+                "Number of X bins",
+                min_value=10,
+                max_value=500,
+                value=None,
+                step=10,
+                key="summary_bins",
             )
+    with control_columns[4]:
+        _, show_legend, x_scale, y_scale = render_plot_view_controls(
+            "summary", str(y_column)
+        )
 
     selection_columns = st.columns(
         [5.4, 1.0], gap="small", vertical_alignment="top"
@@ -2889,13 +3326,18 @@ def render_summary_workspace(
         y_column=str(y_column),
         group_by=str(group_by),
         bin_count=int(bin_count),
+        show_legend=bool(show_legend),
+        x_scale=x_scale,
+        y_scale=y_scale,
+        selected_materials=tuple(selected_materials),
+        selected_velocities=tuple(selected_velocities),
         physical_settings=physical_settings,
     )
     if update_requested:
         st.session_state[applied_key] = draft_request
 
     applied_request = st.session_state.get(applied_key)
-    if applied_request is not None and not hasattr(applied_request, "selected_files"):
+    if applied_request is not None and not hasattr(applied_request, "show_legend"):
         applied_request = None
     if applied_request is None:
         st.info("Choose data series and press Update plots.")
@@ -2930,19 +3372,36 @@ def render_summary_workspace(
         return
 
     mean_figure = make_summary_mean_figure(
-        summary, applied_request.x_column, applied_request.y_column
+        summary,
+        applied_request.x_column,
+        applied_request.y_column,
+        applied_request.show_legend,
+        applied_request.x_scale,
+        applied_request.y_scale,
     )
     peak_figure = px.box(
-        peaks, x="group", y="peak", color="group", points="all",
+        peaks,
+        x="group",
+        y="peak",
+        color="group",
+        points="all",
+        color_discrete_sequence=IFF_PALETTE,
         labels={
             "group": applied_request.group_by,
-            "peak": f"Peak {applied_request.y_column}",
+            "peak": "Peak " + column_axis_title(applied_request.y_column),
         },
     )
     peak_figure.update_layout(
-        height=520, margin={"l": 8, "r": 8, "t": 18, "b": 8},
-        paper_bgcolor="#ffffff", plot_bgcolor="#ffffff", showlegend=False,
+        height=520,
+        margin={"l": 8, "r": 8, "t": 18, "b": 8},
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        showlegend=applied_request.show_legend,
         font={"color": "#344054", "size": 11},
+    )
+    peak_figure.update_yaxes(
+        title="Peak " + column_axis_title(applied_request.y_column),
+        type=normalize_axis_scale(applied_request.y_scale),
     )
     style_axes(peak_figure)
 
@@ -3009,13 +3468,15 @@ def make_summary_mean_figure(
     summary: pd.DataFrame,
     x_label: str,
     y_label: str,
+    show_legend: bool,
+    x_scale: str,
+    y_scale: str,
 ) -> go.Figure:
-    log_y = uses_log_y(y_label)
+    log_y = normalize_axis_scale(y_scale) == "log"
     figure = go.Figure()
-    palette = px.colors.qualitative.Safe
     for index, (group_name, group) in enumerate(summary.groupby("group", sort=True)):
         ordered = group.sort_values("x_mean")
-        color = palette[index % len(palette)]
+        color = IFF_PALETTE[index % len(IFF_PALETTE)]
         mean = ordered["y_mean"]
         lower = mean - ordered["y_std"].fillna(0.0)
         upper = mean + ordered["y_std"].fillna(0.0)
@@ -3024,28 +3485,174 @@ def make_summary_mean_figure(
             lower = lower.where(lower > 0)
             upper = upper.where(upper > 0)
         figure.add_trace(go.Scatter(
-            x=ordered["x_mean"], y=lower, mode="lines",
-            line={"width": 0}, showlegend=False, hoverinfo="skip",
+            x=ordered["x_mean"],
+            y=lower,
+            mode="lines",
+            line={"width": 0},
+            showlegend=False,
+            hoverinfo="skip",
         ))
         figure.add_trace(go.Scatter(
-            x=ordered["x_mean"], y=upper, mode="lines",
-            line={"width": 0}, fill="tonexty", fillcolor=color,
-            opacity=0.16, showlegend=False, hoverinfo="skip",
+            x=ordered["x_mean"],
+            y=upper,
+            mode="lines",
+            line={"width": 0},
+            fill="tonexty",
+            fillcolor=color,
+            opacity=0.16,
+            showlegend=False,
+            hoverinfo="skip",
         ))
         figure.add_trace(go.Scatter(
-            x=ordered["x_mean"], y=mean, mode="lines",
-            line={"color": color, "width": 2}, name=str(group_name),
+            x=ordered["x_mean"],
+            y=mean,
+            mode="lines",
+            line={"color": color, "width": 2},
+            name=str(group_name),
+            showlegend=show_legend,
         ))
     figure.update_layout(
-        height=520, margin={"l": 8, "r": 8, "t": 18, "b": 8},
-        paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
-        hovermode="closest", font={"color": "#344054", "size": 11},
+        height=520,
+        margin={"l": 8, "r": 8, "t": 18, "b": 8},
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        showlegend=show_legend,
+        hovermode="closest",
+        font={"color": "#344054", "size": 11},
         legend={"orientation": "h", "y": 1.02, "x": 0, "font": {"size": 9}},
     )
-    figure.update_xaxes(title=x_label)
-    figure.update_yaxes(title=y_label, type="log" if log_y else "linear")
+    figure.update_xaxes(
+        title=column_axis_title(x_label),
+        type=normalize_axis_scale(x_scale),
+    )
+    figure.update_yaxes(
+        title=column_axis_title(y_label),
+        type=normalize_axis_scale(y_scale),
+    )
     style_axes(figure)
     return figure
+
+def restore_frequency_controls(file_summary: pd.DataFrame) -> None:
+    request = st.session_state.get("frequency_applied_request")
+    if request is None or not hasattr(request, "show_peaks"):
+        return
+
+    st.session_state["frequency_signal"] = request.signal_column
+    st.session_state["frequency_filter_formula"] = format_filter_formula(
+        formula_source_label(request.signal_column),
+        request.filter_settings.workflow,
+    )
+    st.session_state["frequency_filter_source"] = request.signal_column
+    (
+        st.session_state["frequency_peak_min"],
+        st.session_state["frequency_peak_max"],
+        st.session_state["frequency_peak_count"],
+        st.session_state["frequency_energy_bins"],
+        st.session_state["frequency_histogram_bins"],
+    ) = request.peak_settings
+    st.session_state["frequency_individual_plot"] = request.individual_plot
+    st.session_state["frequency_summary_plot"] = request.summary_plot
+    st.session_state["frequency_show_peaks"] = request.show_peaks
+    st.session_state["frequency_show_legend"] = request.show_legend
+    st.session_state["frequency_individual_x_scale"] = (
+        request.individual_x_scale.title()
+    )
+    st.session_state["frequency_individual_y_scale"] = (
+        request.individual_y_scale.title()
+    )
+    st.session_state["frequency_individual_scale_for_plot"] = (
+        request.individual_plot
+    )
+    st.session_state["frequency_summary_x_scale"] = request.summary_x_scale.title()
+    st.session_state["frequency_summary_y_scale"] = request.summary_y_scale.title()
+    st.session_state["frequency_summary_scale_for_plot"] = request.summary_plot
+    restore_selection_controls(
+        "frequency",
+        file_summary,
+        request.selected_files,
+        request.selected_materials,
+        request.selected_velocities,
+    )
+
+
+def render_frequency_axis_controls(
+    key_prefix: str,
+    plot_name: str,
+) -> tuple[str, str]:
+    x_key = f"{key_prefix}_x_scale"
+    y_key = f"{key_prefix}_y_scale"
+    plot_key = f"{key_prefix}_scale_for_plot"
+    st.session_state.setdefault(x_key, "Linear")
+    if st.session_state.get(plot_key) != plot_name:
+        st.session_state[y_key] = "Log" if plot_name == "PSD" else "Linear"
+        st.session_state[plot_key] = plot_name
+    st.session_state.setdefault(y_key, "Linear")
+
+    with st.popover("Axes", icon=":material/straighten:", width="stretch"):
+        columns = st.columns(2, gap="small")
+        with columns[0]:
+            x_scale = st.segmented_control(
+                "X scale",
+                ["Linear", "Log"],
+                key=x_key,
+                required=True,
+                width="stretch",
+            )
+        with columns[1]:
+            y_scale = st.segmented_control(
+                "Y scale",
+                ["Linear", "Log"],
+                key=y_key,
+                required=True,
+                width="stretch",
+            )
+    return normalize_axis_scale(str(x_scale)), normalize_axis_scale(str(y_scale))
+
+
+def render_frequency_individual_view_controls(
+    plot_name: str,
+) -> tuple[bool, bool, str, str]:
+    x_key = "frequency_individual_x_scale"
+    y_key = "frequency_individual_y_scale"
+    plot_key = "frequency_individual_scale_for_plot"
+    st.session_state.setdefault("frequency_show_peaks", True)
+    st.session_state.setdefault("frequency_show_legend", True)
+    st.session_state.setdefault(x_key, "Linear")
+    if st.session_state.get(plot_key) != plot_name:
+        st.session_state[y_key] = "Log" if plot_name == "PSD" else "Linear"
+        st.session_state[plot_key] = plot_name
+    st.session_state.setdefault(y_key, "Linear")
+
+    with st.popover("View", icon=":material/visibility:", width="stretch"):
+        toggle_columns = st.columns(2, gap="small")
+        with toggle_columns[0]:
+            show_peaks = st.toggle("Peaks", key="frequency_show_peaks")
+        with toggle_columns[1]:
+            show_legend = st.toggle("Legend", key="frequency_show_legend")
+        scale_columns = st.columns(2, gap="small")
+        with scale_columns[0]:
+            x_scale = st.segmented_control(
+                "X scale",
+                ["Linear", "Log"],
+                key=x_key,
+                required=True,
+                width="stretch",
+            )
+        with scale_columns[1]:
+            y_scale = st.segmented_control(
+                "Y scale",
+                ["Linear", "Log"],
+                key=y_key,
+                required=True,
+                width="stretch",
+            )
+    return (
+        bool(show_peaks),
+        bool(show_legend),
+        normalize_axis_scale(str(x_scale)),
+        normalize_axis_scale(str(y_scale)),
+    )
+
 
 def render_frequency_workspace(
     file_summary: pd.DataFrame,
@@ -3053,64 +3660,104 @@ def render_frequency_workspace(
     physical_settings: PhysicalSettings,
 ) -> None:
     applied_key = "frequency_applied_request"
-    materials = sorted(file_summary["material"].dropna().unique().tolist())
-    velocities = sorted(file_summary["velocity"].dropna().unique().tolist())
-    filter_columns = st.columns(2, gap="small")
-    with filter_columns[0]:
+    if st.session_state.get("_restore_scope") == "frequency":
+        restore_frequency_controls(file_summary)
+        st.session_state.pop("_restore_scope", None)
+
+    materials = sorted(file_summary["material"].dropna().astype(str).unique())
+    velocities = sorted_velocity_values(file_summary["velocity"])
+    st.session_state.setdefault("frequency_signal", "force_g")
+    st.session_state.setdefault("frequency_individual_plot", "FFT")
+    st.session_state.setdefault(
+        "frequency_summary_plot", "Peak frequency histogram"
+    )
+    setup_columns = st.columns([1.05, 1.05, 1.25, 1.25, 0.78], gap="small")
+    with setup_columns[0]:
         selected_materials = render_filter_dropdown(
             "frequency", "Material", materials
         )
-    with filter_columns[1]:
+    with setup_columns[1]:
         selected_velocities = render_filter_dropdown(
             "frequency", "Velocity", velocities
         )
-    eligible = file_summary[
-        file_summary["material"].isin(selected_materials)
-        & file_summary["velocity"].isin(selected_velocities)
-    ]
-
-    analysis_controls = st.columns([1.7, 1.3, 0.8], gap="small")
-    with analysis_controls[0]:
+    with setup_columns[2]:
         signal_column = st.selectbox(
-            "Signal", AVAILABLE_COLUMNS,
-            index=get_option_index(AVAILABLE_COLUMNS, "force_g"),
+            "Signal",
+            AVAILABLE_COLUMNS,
+            index=None,
             key="frequency_signal",
+            format_func=column_display_label,
         )
-    with analysis_controls[1]:
-        filter_settings = render_processing_controls("frequency", signal_column)
-    with analysis_controls[2]:
+    with setup_columns[3]:
+        filter_settings = render_processing_controls(
+            "frequency", str(signal_column)
+        )
+    with setup_columns[4]:
         peak_settings = render_peak_settings()
 
-    plot_controls = st.columns(2, gap="small")
-    with plot_controls[0]:
-        individual_plot = st.selectbox(
-            "Individual analysis",
-            ["FFT", "PSD", "Energy by frequency band"],
-            key="frequency_individual_plot",
+    eligible = file_summary[
+        file_summary["material"].astype(str).isin(selected_materials)
+        & file_summary["velocity"].astype(str).isin(selected_velocities)
+    ]
+
+    plot_option_columns = st.columns(2, gap="small")
+    with plot_option_columns[0]:
+        individual_options = st.columns(
+            [2.25, 0.68],
+            gap="small",
+            vertical_alignment="bottom",
         )
-    with plot_controls[1]:
-        summary_plot = st.selectbox(
-            "Summary analysis",
-            [
-                "Peak frequency histogram",
-                "Peak amplitude histogram",
-                "Dominant frequency by run",
-            ],
-            key="frequency_summary_plot",
+        with individual_options[0]:
+            individual_plot = st.selectbox(
+                "Individual plot",
+                ["FFT", "PSD", "Energy by frequency band"],
+                index=None,
+                key="frequency_individual_plot",
+            )
+        with individual_options[1]:
+            (
+                show_peaks,
+                show_legend,
+                individual_x_scale,
+                individual_y_scale,
+            ) = render_frequency_individual_view_controls(
+                str(individual_plot)
+            )
+    with plot_option_columns[1]:
+        summary_options = st.columns(
+            [2.25, 0.68],
+            gap="small",
+            vertical_alignment="bottom",
         )
+        with summary_options[0]:
+            summary_plot = st.selectbox(
+                "Summary plot",
+                [
+                    "Peak frequency histogram",
+                    "Peak amplitude histogram",
+                    "Dominant frequency by run",
+                ],
+                index=None,
+                key="frequency_summary_plot",
+            )
+        with summary_options[1]:
+            summary_x_scale, summary_y_scale = render_frequency_axis_controls(
+                "frequency_summary", str(summary_plot)
+            )
 
     selection_columns = st.columns(
-        [5.4, 1.0], gap="small", vertical_alignment="top"
+        [5.4, 0.9], gap="small", vertical_alignment="top"
     )
     with selection_columns[0]:
         selected_files = render_file_selector("frequency", eligible)
     with selection_columns[1]:
         update_requested = st.button(
-            "Update analysis",
+            "Update",
             key="frequency_update",
             type="primary",
             icon=":material/refresh:",
             width="stretch",
+            help="Apply all frequency-analysis controls.",
         )
 
     draft_request = FrequencyRequest(
@@ -3120,19 +3767,27 @@ def render_frequency_workspace(
         peak_settings=peak_settings,
         individual_plot=str(individual_plot),
         summary_plot=str(summary_plot),
+        show_peaks=bool(show_peaks),
+        show_legend=bool(show_legend),
+        individual_x_scale=individual_x_scale,
+        individual_y_scale=individual_y_scale,
+        summary_x_scale=summary_x_scale,
+        summary_y_scale=summary_y_scale,
+        selected_materials=tuple(selected_materials),
+        selected_velocities=tuple(selected_velocities),
         physical_settings=physical_settings,
     )
     if update_requested:
         st.session_state[applied_key] = draft_request
 
     applied_request = st.session_state.get(applied_key)
-    if applied_request is not None and not hasattr(applied_request, "selected_files"):
+    if applied_request is not None and not hasattr(applied_request, "show_peaks"):
         applied_request = None
     if applied_request is None:
-        st.info("Choose data series and press Update analysis.")
+        st.info("Choose data series and press Update.")
         return
     if repr(draft_request) != repr(applied_request):
-        st.caption("Controls changed. Press Update analysis to apply them.")
+        st.caption("Controls changed. Press Update to apply them.")
     if not applied_request.selected_files:
         st.info("No data series are applied to frequency analysis.")
         return
@@ -3165,31 +3820,64 @@ def render_frequency_workspace(
 
 
 def render_peak_settings() -> tuple[float, float, int, int, int]:
-    with st.popover("Peak search", width="stretch"):
-        peak_min = st.number_input(
-            "Minimum frequency (Hz)", min_value=0.0, value=0.1, step=0.1,
+    defaults = {
+        "frequency_peak_min": 0.1,
+        "frequency_peak_max": 10.0,
+        "frequency_peak_count": 3,
+        "frequency_energy_bins": 20,
+        "frequency_histogram_bins": 12,
+    }
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
+
+    with st.popover(
+        "Peaks",
+        icon=":material/finance:",
+        width="stretch",
+    ):
+        range_columns = st.columns(2, gap="small")
+        peak_min = range_columns[0].number_input(
+            "Minimum (Hz)",
+            min_value=0.0,
+            value=None,
+            step=0.1,
             key="frequency_peak_min",
         )
-        peak_max = st.number_input(
-            "Maximum frequency (Hz)", min_value=0.001, value=10.0, step=0.5,
+        peak_max = range_columns[1].number_input(
+            "Maximum (Hz)",
+            min_value=0.001,
+            value=None,
+            step=0.5,
             key="frequency_peak_max",
         )
-        peak_count = st.number_input(
-            "Strongest peaks / run", min_value=1, max_value=20, value=3, step=1,
+        detail_columns = st.columns(3, gap="small")
+        peak_count = detail_columns[0].number_input(
+            "Peaks / run",
+            min_value=1,
+            max_value=20,
+            value=None,
+            step=1,
             key="frequency_peak_count",
         )
-        energy_bins = st.number_input(
-            "Energy bands", min_value=4, max_value=100, value=20, step=1,
+        energy_bins = detail_columns[1].number_input(
+            "Energy bands",
+            min_value=4,
+            max_value=100,
+            value=None,
+            step=1,
             key="frequency_energy_bins",
         )
-        histogram_bins = st.number_input(
-            "Peak histogram bins", min_value=3, max_value=100, value=12, step=1,
+        histogram_bins = detail_columns[2].number_input(
+            "Histogram bins",
+            min_value=3,
+            max_value=100,
+            value=None,
+            step=1,
             key="frequency_histogram_bins",
         )
     minimum = float(peak_min)
     maximum = max(minimum + 1e-9, float(peak_max))
     return minimum, maximum, int(peak_count), int(energy_bins), int(histogram_bins)
-
 
 def render_background_frequency(
     job_key: str,
@@ -3216,6 +3904,33 @@ def render_background_frequency(
         return
     render_frequency_results(result, request, series_labels)
 
+def math_axis_title(symbol: str, unit: str) -> str:
+    return f"{symbol} [{unit}]"
+
+
+def spectrum_axis_title(kind: str, signal_column: str) -> str:
+    symbol = COLUMN_AXIS_SYMBOLS.get(signal_column, signal_column)
+    unit = COLUMN_UNITS.get(signal_column, "-")
+    if kind == "FFT":
+        return math_axis_title(f"|FFT({symbol})|", unit)
+    if kind == "PSD":
+        psd_unit = (
+            "Hz<sup>-1</sup>"
+            if unit == "-"
+            else f"{unit}<sup>2</sup> Hz<sup>-1</sup>"
+        )
+        return math_axis_title(f"PSD({symbol})", psd_unit)
+    energy_unit = "-" if unit == "-" else f"{unit}<sup>2</sup>"
+    return math_axis_title(f"<i>E</i>({symbol})", energy_unit)
+
+def scale_range(minimum: float, maximum: float, scale: str) -> list[float]:
+    if normalize_axis_scale(scale) == "log":
+        lower = max(float(minimum), np.finfo(float).tiny)
+        upper = max(float(maximum), lower * (1.0 + 1e-9))
+        return [float(np.log10(lower)), float(np.log10(upper))]
+    return [float(minimum), float(maximum)]
+
+
 def render_frequency_results(
     batch: FrequencyBatchResult,
     request: FrequencyRequest,
@@ -3238,7 +3953,6 @@ def render_frequency_results(
         f"Top {peak_count} peak(s) per run"
     )
 
-    palette = px.colors.qualitative.Safe
     individual_figure = go.Figure()
     peak_rows: list[dict[str, Any]] = []
     warnings: list[str] = []
@@ -3246,7 +3960,7 @@ def render_frequency_results(
 
     for index, (source_file, result) in enumerate(batch.results.items()):
         label = series_labels.get(source_file, source_file)
-        color = palette[index % len(palette)]
+        color = IFF_PALETTE[index % len(IFF_PALETTE)]
         if request.individual_plot == "FFT":
             individual_figure.add_trace(go.Scatter(
                 x=result.frequency_hz,
@@ -3255,13 +3969,19 @@ def render_frequency_results(
                 line={"color": color, "width": 1.6},
                 name=label,
                 legendgroup=source_file,
+                showlegend=request.show_legend,
             ))
-            if result.peaks_hz.size:
+            if request.show_peaks and result.peaks_hz.size:
                 individual_figure.add_trace(go.Scatter(
                     x=result.peaks_hz,
                     y=result.peak_amplitudes,
                     mode="markers",
-                    marker={"color": color, "size": 7, "symbol": "circle-open"},
+                    marker={
+                        "color": color,
+                        "size": 8,
+                        "symbol": "circle-open",
+                        "line": {"width": 1.5},
+                    },
                     name=f"{label} peaks",
                     legendgroup=source_file,
                     showlegend=False,
@@ -3278,7 +3998,32 @@ def render_frequency_results(
                 line={"color": color, "width": 1.6},
                 name=label,
                 legendgroup=source_file,
+                showlegend=request.show_legend,
             ))
+            if request.show_peaks and result.peaks_hz.size:
+                peak_psd = np.interp(
+                    result.peaks_hz,
+                    result.psd_frequency_hz,
+                    result.psd,
+                )
+                individual_figure.add_trace(go.Scatter(
+                    x=result.peaks_hz,
+                    y=peak_psd,
+                    mode="markers",
+                    marker={
+                        "color": color,
+                        "size": 8,
+                        "symbol": "circle-open",
+                        "line": {"width": 1.5},
+                    },
+                    name=f"{label} peaks",
+                    legendgroup=source_file,
+                    showlegend=False,
+                    hovertemplate=(
+                        f"{label}<br>Frequency: %{{x:.4g}} Hz"
+                        "<br>PSD: %{y:.4g}<extra></extra>"
+                    ),
+                ))
         else:
             centers = (result.energy_left_hz + result.energy_right_hz) / 2.0
             individual_figure.add_trace(go.Scatter(
@@ -3289,6 +4034,7 @@ def render_frequency_results(
                 marker={"color": color, "size": 4},
                 name=label,
                 legendgroup=source_file,
+                showlegend=request.show_legend,
             ))
 
         ranked = np.argsort(result.peak_amplitudes)[::-1]
@@ -3305,24 +4051,32 @@ def render_frequency_results(
             values = ", ".join(f"{value:.4g}" for value in result.notch_peaks_hz)
             notch_rows.append(f"{label}: {values} Hz")
 
-    show_legend = len(batch.results) > 1
-    legend = {"orientation": "h", "y": 1.02, "x": 0, "font": {"size": 9}}
     if request.individual_plot == "FFT":
-        individual_x = "Frequency (Hz)"
-        individual_y = f"FFT amplitude ({request.signal_column})"
+        individual_x = math_axis_title("<i>f</i>", "Hz")
+        individual_y = spectrum_axis_title("FFT", request.signal_column)
     elif request.individual_plot == "PSD":
-        individual_x = "Frequency (Hz)"
-        individual_y = f"PSD ({request.signal_column})^2/Hz"
+        individual_x = math_axis_title("<i>f</i>", "Hz")
+        individual_y = spectrum_axis_title("PSD", request.signal_column)
     else:
-        individual_x = "Frequency band (Hz)"
-        individual_y = "Integrated PSD energy"
+        individual_x = math_axis_title("<i>f</i>", "Hz")
+        individual_y = spectrum_axis_title("Energy", request.signal_column)
     configure_analysis_figure(
-        individual_figure, individual_x, individual_y, 520
+        individual_figure,
+        individual_x,
+        individual_y,
+        520,
+        request.individual_x_scale,
+        request.individual_y_scale,
     )
-    individual_figure.update_layout(showlegend=show_legend, legend=legend)
-    individual_figure.update_xaxes(range=[peak_min_hz, peak_max_hz])
-    if request.individual_plot == "PSD":
-        individual_figure.update_yaxes(type="log")
+    individual_figure.update_layout(
+        showlegend=request.show_legend,
+        legend={"orientation": "h", "y": 1.02, "x": 0, "font": {"size": 9}},
+    )
+    individual_figure.update_xaxes(
+        range=scale_range(
+            peak_min_hz, peak_max_hz, request.individual_x_scale
+        )
+    )
 
     peak_table = pd.DataFrame(peak_rows)
     summary_figure = go.Figure()
@@ -3331,23 +4085,29 @@ def render_frequency_results(
             bin_size = (peak_max_hz - peak_min_hz) / histogram_bins
             summary_figure.add_trace(go.Histogram(
                 x=peak_table["frequency_Hz"],
-                xbins={"start": peak_min_hz, "end": peak_max_hz, "size": bin_size},
-                marker={"color": "#7559a6"},
+                xbins={
+                    "start": peak_min_hz,
+                    "end": peak_max_hz,
+                    "size": bin_size,
+                },
+                marker={"color": "#0075CF"},
                 hovertemplate=(
                     "Frequency: %{x:.4g} Hz<br>Count: %{y}<extra></extra>"
                 ),
             ))
-            summary_x = "Peak frequency (Hz)"
-            summary_y = "Peak count"
+            summary_x = math_axis_title("<i>f</i><sub>p</sub>", "Hz")
+            summary_y = math_axis_title("<i>N</i><sub>p</sub>", "-")
         elif request.summary_plot == "Peak amplitude histogram":
             summary_figure.add_trace(go.Histogram(
                 x=peak_table["amplitude"],
                 nbinsx=histogram_bins,
-                marker={"color": "#287d8e"},
-                hovertemplate="Amplitude: %{x:.4g}<br>Count: %{y}<extra></extra>",
+                marker={"color": "#00A6A6"},
+                hovertemplate=(
+                    "Amplitude: %{x:.4g}<br>Count: %{y}<extra></extra>"
+                ),
             ))
-            summary_x = f"Peak amplitude ({request.signal_column})"
-            summary_y = "Peak count"
+            summary_x = spectrum_axis_title("FFT", request.signal_column)
+            summary_y = math_axis_title("<i>N</i><sub>p</sub>", "-")
         else:
             dominant = peak_table.loc[peak_table["rank"] == 1].copy()
             summary_figure.add_trace(go.Bar(
@@ -3355,7 +4115,7 @@ def render_frequency_results(
                 y=dominant["frequency_Hz"],
                 marker={
                     "color": [
-                        palette[index % len(palette)]
+                        IFF_PALETTE[index % len(IFF_PALETTE)]
                         for index in range(len(dominant))
                     ]
                 },
@@ -3365,22 +4125,42 @@ def render_frequency_results(
                     "<br>%{customdata[0]}<extra></extra>"
                 ),
             ))
-            summary_x = "Data series"
-            summary_y = "Dominant frequency (Hz)"
+            summary_x = "Data series [-]"
+            summary_y = math_axis_title("<i>f</i><sub>dom</sub>", "Hz")
     else:
-        summary_x = "Peak frequency (Hz)"
-        summary_y = "Peak count"
+        summary_x = math_axis_title("<i>f</i><sub>p</sub>", "Hz")
+        summary_y = math_axis_title("<i>N</i><sub>p</sub>", "-")
         summary_figure.add_annotation(
             text="No peaks detected in the applied range",
-            x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False,
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
         )
 
-    configure_analysis_figure(summary_figure, summary_x, summary_y, 520)
+    configure_analysis_figure(
+        summary_figure,
+        summary_x,
+        summary_y,
+        520,
+        request.summary_x_scale,
+        request.summary_y_scale,
+    )
     summary_figure.update_layout(showlegend=False)
     if request.summary_plot == "Peak frequency histogram":
-        summary_figure.update_xaxes(range=[peak_min_hz, peak_max_hz])
+        summary_figure.update_xaxes(
+            range=scale_range(
+                peak_min_hz, peak_max_hz, request.summary_x_scale
+            )
+        )
     elif request.summary_plot == "Dominant frequency by run":
-        summary_figure.update_yaxes(range=[peak_min_hz, peak_max_hz])
+        summary_figure.update_xaxes(type="category")
+        summary_figure.update_yaxes(
+            range=scale_range(
+                peak_min_hz, peak_max_hz, request.summary_y_scale
+            )
+        )
 
     chart_columns = st.columns(2, gap="small")
     with chart_columns[0]:
@@ -3427,19 +4207,32 @@ def render_frequency_results(
             for message in all_messages:
                 st.caption(message)
 
+
 def configure_analysis_figure(
     figure: go.Figure,
     x_title: str,
     y_title: str,
     height: int,
+    x_scale: str = "linear",
+    y_scale: str = "linear",
 ) -> None:
     figure.update_layout(
-        height=height, margin={"l": 8, "r": 8, "t": 18, "b": 8},
-        paper_bgcolor="#ffffff", plot_bgcolor="#ffffff", showlegend=False,
-        hovermode="closest", font={"color": "#344054", "size": 11},
+        height=height,
+        margin={"l": 8, "r": 8, "t": 18, "b": 8},
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        showlegend=False,
+        hovermode="closest",
+        font={"color": "#344054", "size": 11},
     )
-    figure.update_xaxes(title=x_title)
-    figure.update_yaxes(title=y_title)
+    figure.update_xaxes(
+        title=x_title,
+        type=normalize_axis_scale(x_scale),
+    )
+    figure.update_yaxes(
+        title=y_title,
+        type=normalize_axis_scale(y_scale),
+    )
     style_axes(figure)
 
 if __name__ == "__main__":

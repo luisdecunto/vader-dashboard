@@ -60,8 +60,14 @@ It still requires the packages listed in `requirements.txt` to be installed.
 - Physical settings remain available from the fixed top-right toolbar without taking plot space.
 - Raw data contains the original CSV variables and no processing controls.
 - Filtered / processed contains derived variables and independent background-processing controls for both plots.
-- Frequency analysis contains FFT, Welch PSD, energy histograms, detected peaks, and optional preprocessing.
+- Plot View menus control raw overlays, legends, and independent linear/log axis scales.
+- Velocity is available as a numeric X or Y variable and velocity choices sort numerically.
+- Plot labels use scientific symbols, subscripts, superscripts, and bracketed units.
+- Data-series panels stay open while selecting multiple runs.
+- Applied plot, filter, and frequency settings are restored when returning to a workspace.
+- Frequency analysis contains FFT, Welch PSD, energy histograms, optional peak markers, and compact per-plot controls.
 - Summary plots contains binned mean curves with standard-deviation bands and per-experiment peak distributions.
+- The IFF-friendly palette uses `#0075CF` as its primary accent and avoids red plot colors.
 - CSV files in `data` are ignored by Git so confidential work data is not accidentally committed.
 
 ## Processing formulas
@@ -110,8 +116,8 @@ area_m2 = pi * (diameter_mm * 1e-3 / 2)^2
 stress_Pa = force_N / area_m2
 surface_tension_stress_Pa = capillary_factor * surface_tension_N_m / diameter_m
 net_stress_Pa = stress_Pa - surface_tension_stress_Pa
-hencky_strain = -2 * radial_Hencky_strain
-hencky_strain_rate_1_s = d(hencky_strain) / dt
+hencky_strain = radial_Hencky_strain
+hencky_strain_rate_1_s = d(radial_Hencky_strain) / dt
 extensional_viscosity_Pa_s = net_stress_Pa / hencky_strain_rate_1_s
 ```
 
