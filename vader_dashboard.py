@@ -54,7 +54,7 @@ IFF_PALETTE = (
 COLUMN_DISPLAY_LABELS = {
     "time_from_onset_s": "Time from onset",
     "vertical_distance_L": "Vertical distance",
-    "radial_Hencky_strain": "HD strain",
+    "radial_Hencky_strain": "HS strain",
     "vertical_strain": "Vertical strain",
     "D_over_D0": "D / D0",
     "force_g": "Force",
@@ -64,14 +64,14 @@ COLUMN_DISPLAY_LABELS = {
     "stress_Pa": "Stress",
     "surface_tension_stress_Pa": "Surface-tension stress",
     "net_stress_Pa": "Net stress",
-    "hencky_strain": "HD strain (derived)",
-    "hencky_strain_rate_1_s": "HD strain rate",
+    "hencky_strain": "HS strain (derived)",
+    "hencky_strain_rate_1_s": "HS strain rate",
     "extensional_viscosity_Pa_s": "Extensional viscosity",
 }
 COLUMN_AXIS_SYMBOLS = {
     "time_from_onset_s": "<i>t</i>",
     "vertical_distance_L": "<i>L</i><sub>v</sub>",
-    "radial_Hencky_strain": "ε<sub>HD</sub>",
+    "radial_Hencky_strain": "ε<sub>HS</sub>",
     "vertical_strain": "ε<sub>z</sub>",
     "D_over_D0": "<i>D</i>/<i>D</i><sub>0</sub>",
     "force_g": "<i>F</i>",
@@ -81,8 +81,8 @@ COLUMN_AXIS_SYMBOLS = {
     "stress_Pa": "σ",
     "surface_tension_stress_Pa": "σ<sub>γ</sub>",
     "net_stress_Pa": "σ<sub>net</sub>",
-    "hencky_strain": "ε<sub>HD</sub>",
-    "hencky_strain_rate_1_s": "ε̇<sub>HD</sub>",
+    "hencky_strain": "ε<sub>HS</sub>",
+    "hencky_strain_rate_1_s": "ε̇<sub>HS</sub>",
     "extensional_viscosity_Pa_s": "η<sub>E</sub>",
 }
 
@@ -216,11 +216,15 @@ def column_axis_title(column: str) -> str:
     return f"{symbol} [{unit}]"
 
 def formula_source_label(source_column: str) -> str:
-    return "HD" if source_column == "radial_Hencky_strain" else source_column
+    return "HS" if source_column == "radial_Hencky_strain" else source_column
 
 
 def canonical_formula_source(source_name: str) -> str:
-    return "radial_Hencky_strain" if source_name.upper() == "HD" else source_name
+    return (
+        "radial_Hencky_strain"
+        if source_name.upper() in {"HS", "HD"}
+        else source_name
+    )
 
 
 def parse_velocity_value(value: Any) -> float:
@@ -913,7 +917,7 @@ def align_formula_variants(
         strain_variants = strain_variants * count
     if len(force_variants) != len(strain_variants):
         raise ValueError(
-            "Force and HD-strain formula lists must have the same length, "
+            "Force and HS-strain formula lists must have the same length, "
             "unless one list has only one formula."
         )
     return force_variants, strain_variants
@@ -1415,12 +1419,66 @@ def inject_styles() -> None:
             --vader-rail: 4rem;
         }
         button[data-testid="stBaseButton-primary"] {
-            background-color: var(--vader-accent);
-            border-color: var(--vader-accent);
+            color: #ffffff !important;
+            background-color: var(--vader-accent) !important;
+            border-color: var(--vader-accent) !important;
         }
-        button[data-testid="stBaseButton-primary"]:hover {
-            background-color: #005FA8;
-            border-color: #005FA8;
+        button[data-testid="stBaseButton-primary"]:hover,
+        button[data-testid="stBaseButton-primary"]:focus,
+        button[data-testid="stBaseButton-primary"]:active {
+            color: #ffffff !important;
+            background-color: #005FA8 !important;
+            border-color: #005FA8 !important;
+            box-shadow: 0 0 0 1px rgba(0, 117, 207, 0.24) !important;
+        }
+        input[type="checkbox"] {
+            accent-color: var(--vader-accent);
+        }
+        label[data-baseweb="checkbox"] input[type="checkbox"]:checked + div,
+        label[data-baseweb="checkbox"] input[role="switch"]:checked + div {
+            background-color: var(--vader-accent) !important;
+            border-color: var(--vader-accent) !important;
+        }
+        label[data-baseweb="checkbox"] input:checked + div svg {
+            color: #ffffff !important;
+            fill: #ffffff !important;
+        }
+        label[data-react-aria-pressable="true"][data-selected="true"]
+        > div:first-of-type {
+            background-color: var(--vader-accent) !important;
+            border-color: var(--vader-accent) !important;
+        }
+        label[data-react-aria-pressable="true"][data-selected="true"]
+        > div:first-of-type svg {
+            color: #ffffff !important;
+            stroke: #ffffff !important;
+        }
+        button[aria-expanded="true"] {
+            border-color: var(--vader-accent) !important;
+            box-shadow: 0 0 0 1px rgba(0, 117, 207, 0.22) !important;
+        }
+        div[data-testid="stSegmentedControl"] button[aria-pressed="true"] {
+            color: #ffffff !important;
+            background-color: var(--vader-accent) !important;
+            border-color: var(--vader-accent) !important;
+        }
+        div[data-testid="stSegmentedControl"] button[aria-pressed="true"] p {
+            color: #ffffff !important;
+        }
+        div[class*="_compact_view"] button p {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            padding: 0;
+            margin: -1px;
+            overflow: hidden;
+            clip: rect(0, 0, 0, 0);
+            white-space: nowrap;
+            border: 0;
+        }
+        div[class*="_compact_view"] button {
+            padding-right: 0.35rem;
+            padding-left: 0.35rem;
         }
         header[data-testid="stHeader"],
         [data-testid="stSidebar"],
@@ -1764,7 +1822,7 @@ def render_physical_settings() -> PhysicalSettings:
             )
             st.caption(
                 "Stress = force / area. Net stress subtracts capillary stress. "
-                "Extensional viscosity = net stress / HD strain rate."
+                "Extensional viscosity = net stress / HS strain rate."
             )
     return PhysicalSettings(
         surface_tension_mN_m=float(surface_tension),
@@ -2073,6 +2131,29 @@ def render_plot_view_controls(
         normalize_axis_scale(str(y_scale)),
     )
 
+def render_axis_selector(
+    key_prefix: str,
+    axis_name: str,
+    axis_options: list[str],
+) -> str:
+    row = st.columns(
+        [0.18, 1],
+        gap="small",
+        vertical_alignment="center",
+    )
+    with row[0]:
+        render_inline_label(f"{axis_name}:")
+    with row[1]:
+        selected = st.selectbox(
+            f"{axis_name} axis",
+            axis_options,
+            index=None,
+            key=f"{key_prefix}_{axis_name.lower()}",
+            label_visibility="collapsed",
+            format_func=column_display_label,
+        )
+    return str(selected)
+
 def render_plot_window(
     index: int,
     file_summary: pd.DataFrame,
@@ -2093,105 +2174,91 @@ def render_plot_window(
         materials = sorted(file_summary["material"].dropna().astype(str).unique())
         velocities = sorted_velocity_values(file_summary["velocity"])
         force_variants = parse_filter_formula_list("force_g", "force_g")
-        strain_variants = parse_filter_formula_list("HD", "radial_Hencky_strain")
+        strain_variants = parse_filter_formula_list("HS", "radial_Hencky_strain")
         show_raw_overlay = False
         st.session_state.setdefault(f"{key_prefix}_x", defaults["x"])
         st.session_state.setdefault(f"{key_prefix}_y", defaults["y"])
 
-        axis_toolbar = st.columns(
-            [0.28, 1.35, 0.28, 1.35],
-            gap="small",
-            vertical_alignment="center",
+        selector_scope = f"{scope}_{index}"
+        group_widths = (
+            [1.45, 1, 1, 1.15]
+            if allow_processing
+            else [1.6, 1, 1.15]
         )
-        with axis_toolbar[0]:
-            render_inline_label("X:")
-        with axis_toolbar[1]:
-            x_column = st.selectbox(
-                "X axis",
-                axis_options,
-                index=None,
-                key=f"{key_prefix}_x",
-                label_visibility="collapsed",
-                format_func=column_display_label,
+        control_groups = st.columns(
+            group_widths,
+            gap="small",
+            vertical_alignment="top",
+        )
+
+        with control_groups[0]:
+            x_column = render_axis_selector(
+                key_prefix, "X", axis_options
             )
-        with axis_toolbar[2]:
-            render_inline_label("Y:")
-        with axis_toolbar[3]:
-            y_column = st.selectbox(
-                "Y axis",
-                axis_options,
-                index=None,
-                key=f"{key_prefix}_y",
-                label_visibility="collapsed",
-                format_func=column_display_label,
+            y_column = render_axis_selector(
+                key_prefix, "Y", axis_options
             )
 
-        selector_scope = f"{scope}_{index}"
-        if allow_processing:
-            option_toolbar = st.columns(
-                [1, 1, 1, 1, 1],
-                gap="small",
-                vertical_alignment="center",
+        with control_groups[1]:
+            selected_materials = render_filter_dropdown(
+                selector_scope, "Material", materials
             )
-            with option_toolbar[0]:
+            selected_velocities = render_filter_dropdown(
+                selector_scope, "Velocity", velocities
+            )
+
+        if allow_processing:
+            with control_groups[2]:
                 force_variants = render_formula_variant_controls(
                     f"{key_prefix}_force", "Force", "force_g"
                 )
-            with option_toolbar[1]:
                 strain_variants = render_formula_variant_controls(
-                    f"{key_prefix}_strain", "HD", "radial_Hencky_strain"
+                    f"{key_prefix}_strain", "HS", "radial_Hencky_strain"
                 )
-            with option_toolbar[2]:
-                selected_materials = render_filter_dropdown(
-                    selector_scope, "Material", materials
-                )
-            with option_toolbar[3]:
-                selected_velocities = render_filter_dropdown(
-                    selector_scope, "Velocity", velocities
-                )
-            with option_toolbar[4]:
-                (
-                    show_raw_overlay,
-                    show_legend,
-                    x_scale,
-                    y_scale,
-                ) = render_plot_view_controls(
-                    key_prefix, str(y_column), allow_raw_overlay=True
-                )
+            action_group = control_groups[3]
         else:
-            filter_toolbar = st.columns([1, 1, 0.9], gap="small")
-            with filter_toolbar[0]:
-                selected_materials = render_filter_dropdown(
-                    selector_scope, "Material", materials
-                )
-            with filter_toolbar[1]:
-                selected_velocities = render_filter_dropdown(
-                    selector_scope, "Velocity", velocities
-                )
-            with filter_toolbar[2]:
-                _, show_legend, x_scale, y_scale = render_plot_view_controls(
-                    key_prefix, str(y_column)
-                )
+            action_group = control_groups[2]
 
         eligible_summary = file_summary[
             file_summary["material"].astype(str).isin(selected_materials)
             & file_summary["velocity"].astype(str).isin(selected_velocities)
         ]
-        selection_columns = st.columns(
-            [7.5, 0.65], gap="small", vertical_alignment="top"
-        )
-        with selection_columns[0]:
-            selected_files = render_file_selector(selector_scope, eligible_summary)
-        with selection_columns[1]:
-            update_requested = st.button(
-                "",
-                key=f"{key_prefix}_update",
-                type="primary",
-                icon=":material/refresh:",
-                help="Update this plot",
-                width="stretch",
+        with action_group:
+            selected_files = render_file_selector(
+                selector_scope, eligible_summary
             )
-
+            action_columns = st.columns(
+                [1.7, 0.55],
+                gap="small",
+                vertical_alignment="center",
+            )
+            with action_columns[0]:
+                with st.container(key=f"{key_prefix}_compact_view"):
+                    if allow_processing:
+                        (
+                            show_raw_overlay,
+                            show_legend,
+                            x_scale,
+                            y_scale,
+                        ) = render_plot_view_controls(
+                            key_prefix, y_column, allow_raw_overlay=True
+                        )
+                    else:
+                        (
+                            _,
+                            show_legend,
+                            x_scale,
+                            y_scale,
+                        ) = render_plot_view_controls(key_prefix, y_column)
+            with action_columns[1]:
+                update_requested = st.button(
+                    "",
+                    key=f"{key_prefix}_update",
+                    type="primary",
+                    icon=":material/refresh:",
+                    help="Update this plot",
+                    width="stretch",
+                )
         draft_request = PlotRequest(
             x_column=str(x_column),
             y_column=str(y_column),
@@ -2613,9 +2680,6 @@ def update_filter_formula(
         steps = ()
     st.session_state[formula_key] = format_filter_formula(formula_source_label(parsed_source), steps)
 
-def persist_control_value(widget_key: str, store_key: str) -> None:
-    st.session_state[store_key] = st.session_state.get(widget_key)
-
 
 def numerically_sorted_file_summary(file_summary: pd.DataFrame) -> pd.DataFrame:
     if file_summary.empty:
@@ -2641,53 +2705,56 @@ def render_file_selector(index: int | str, file_summary: pd.DataFrame) -> list[s
         bool(st.session_state[f"plot_{index}_file_{file_name}"])
         for file_name in files
     )
-    panel_key = f"plot_{index}_data_panel_open"
-    panel_store_key = f"keep_{panel_key}"
-    if panel_key not in st.session_state:
-        st.session_state[panel_key] = bool(
-            st.session_state.get(panel_store_key, False)
-        )
-    panel_open = st.toggle(
-        f"Data series  {selected_count}/{len(files)}",
-        key=panel_key,
-        on_change=persist_control_value,
-        args=(panel_key, panel_store_key),
-    )
+    with st.popover(
+        f"Runs {selected_count}/{len(files)}",
+        icon=":material/dataset:",
+        help="Choose data series",
+        width="stretch",
+    ):
+        with st.form(f"plot_{index}_series_form", border=False):
+            if files:
+                checkbox_columns = st.columns(2, gap="small")
+                for file_index, row in ordered_summary.reset_index(
+                    drop=True
+                ).iterrows():
+                    file_name = row["source_file"]
+                    label = get_file_label(row)
+                    with checkbox_columns[file_index % len(checkbox_columns)]:
+                        st.checkbox(
+                            label,
+                            key=f"plot_{index}_file_{file_name}",
+                            help=file_name,
+                        )
+            else:
+                st.caption("No runs match the material and velocity filters.")
 
-    selected_files: list[str] = []
-    if panel_open:
-        with st.container(border=True):
-            action_columns = st.columns([1, 1, 4], gap="small")
-            if action_columns[0].button(
-                "All", key=f"plot_{index}_all", width="stretch"
-            ):
-                set_file_selection(index, files, True)
-                st.rerun()
-            if action_columns[1].button(
-                "None", key=f"plot_{index}_none", width="stretch"
-            ):
-                set_file_selection(index, files, False)
-                st.rerun()
+            action_columns = st.columns(3, gap="small")
+            action_columns[0].form_submit_button(
+                "All",
+                on_click=set_file_selection,
+                args=(index, files, True),
+                disabled=not files,
+                width="stretch",
+            )
+            action_columns[1].form_submit_button(
+                "None",
+                on_click=set_file_selection,
+                args=(index, files, False),
+                disabled=not files,
+                width="stretch",
+            )
+            action_columns[2].form_submit_button(
+                "Done",
+                type="primary",
+                disabled=not files,
+                width="stretch",
+            )
 
-            checkbox_columns = st.columns(3, gap="small")
-            for file_index, row in ordered_summary.reset_index(drop=True).iterrows():
-                file_name = row["source_file"]
-                label = get_file_label(row)
-                with checkbox_columns[file_index % len(checkbox_columns)]:
-                    if st.checkbox(
-                        label,
-                        key=f"plot_{index}_file_{file_name}",
-                        help=file_name,
-                    ):
-                        selected_files.append(file_name)
-    else:
-        selected_files = [
-            file_name
-            for file_name in files
-            if st.session_state[f"plot_{index}_file_{file_name}"]
-        ]
-
-    return selected_files
+    return [
+        file_name
+        for file_name in files
+        if st.session_state[f"plot_{index}_file_{file_name}"]
+    ]
 
 def set_file_selection(index: int | str, files: list[str], selected: bool) -> None:
     for file_name in files:

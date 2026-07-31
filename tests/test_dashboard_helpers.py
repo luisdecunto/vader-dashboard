@@ -19,22 +19,24 @@ class DashboardDisplayTests(unittest.TestCase):
             ["2mms", "5mms", "10mms"],
         )
 
-    def test_hd_alias_is_canonicalized_for_processing(self) -> None:
-        source, steps = parse_filter_formula("LP(HD,20)")
+    def test_hs_alias_is_canonicalized_for_processing(self) -> None:
+        source, steps = parse_filter_formula("LP(HS,20)")
         self.assertEqual(source, "radial_Hencky_strain")
         self.assertEqual(steps[0].operation, "lowpass")
+        legacy_source, _ = parse_filter_formula("LP(HD,20)")
+        self.assertEqual(legacy_source, "radial_Hencky_strain")
         variants = parse_filter_formula_list(
-            "HD; LP(HD,20)", "radial_Hencky_strain"
+            "HS; LP(HS,20)", "radial_Hencky_strain"
         )
         self.assertEqual(
             [variant.expression for variant in variants],
-            ["HD", "LP(HD,20)"],
+            ["HS", "LP(HS,20)"],
         )
 
     def test_plot_labels_use_scientific_notation_and_units(self) -> None:
-        self.assertEqual(column_display_label("radial_Hencky_strain"), "HD strain")
+        self.assertEqual(column_display_label("radial_Hencky_strain"), "HS strain")
         self.assertEqual(column_display_label(VELOCITY_COLUMN), "Velocity")
-        self.assertIn("ε<sub>HD</sub>", column_axis_title("radial_Hencky_strain"))
+        self.assertIn("ε<sub>HS</sub>", column_axis_title("radial_Hencky_strain"))
         self.assertIn("[-]", column_axis_title("radial_Hencky_strain"))
         self.assertIn("mm s<sup>-1</sup>", column_axis_title(VELOCITY_COLUMN))
 
