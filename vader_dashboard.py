@@ -1418,14 +1418,18 @@ def inject_styles() -> None:
             --vader-accent: #0075CF;
             --vader-rail: 4rem;
         }
-        button[data-testid="stBaseButton-primary"] {
+        button[data-testid="stBaseButton-primary"],
+        button[data-testid="stBaseButton-primaryFormSubmit"] {
             color: #ffffff !important;
             background-color: var(--vader-accent) !important;
             border-color: var(--vader-accent) !important;
         }
         button[data-testid="stBaseButton-primary"]:hover,
         button[data-testid="stBaseButton-primary"]:focus,
-        button[data-testid="stBaseButton-primary"]:active {
+        button[data-testid="stBaseButton-primary"]:active,
+        button[data-testid="stBaseButton-primaryFormSubmit"]:hover,
+        button[data-testid="stBaseButton-primaryFormSubmit"]:focus,
+        button[data-testid="stBaseButton-primaryFormSubmit"]:active {
             color: #ffffff !important;
             background-color: #005FA8 !important;
             border-color: #005FA8 !important;
@@ -1456,6 +1460,11 @@ def inject_styles() -> None:
         button[aria-expanded="true"] {
             border-color: var(--vader-accent) !important;
             box-shadow: 0 0 0 1px rgba(0, 117, 207, 0.22) !important;
+        }
+        button[data-testid="stPopoverButton"]:focus,
+        button[data-testid="stPopoverButton"]:focus-visible {
+            border-color: var(--vader-accent) !important;
+            box-shadow: 0 0 0 3px rgba(0, 117, 207, 0.2) !important;
         }
         div[data-testid="stSegmentedControl"] button[aria-pressed="true"] {
             color: #ffffff !important;
@@ -1691,6 +1700,17 @@ def inject_styles() -> None:
             color: var(--vader-muted);
             font-size: 0.74rem;
             font-weight: 600;
+            white-space: nowrap;
+        }
+        .frequency-row-label {
+            display: flex;
+            align-items: center;
+            min-height: 2.5rem;
+            color: var(--vader-muted);
+            font-size: 0.7rem;
+            font-weight: 700;
+            letter-spacing: 0;
+            text-transform: uppercase;
             white-space: nowrap;
         }
         @media (max-width: 900px) {
@@ -3721,6 +3741,13 @@ def render_frequency_individual_view_controls(
     )
 
 
+def render_frequency_row_label(label: str) -> None:
+    st.markdown(
+        f'<div class="frequency-row-label">{label}</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def render_frequency_workspace(
     file_summary: pd.DataFrame,
     signature: tuple[tuple[str, int, int], ...],
@@ -3738,50 +3765,77 @@ def render_frequency_workspace(
     st.session_state.setdefault(
         "frequency_summary_plot", "Peak frequency histogram"
     )
-    setup_columns = st.columns([1.05, 1.05, 1.25, 1.25, 0.78], gap="small")
-    with setup_columns[0]:
-        selected_materials = render_filter_dropdown(
-            "frequency", "Material", materials
-        )
-    with setup_columns[1]:
-        selected_velocities = render_filter_dropdown(
-            "frequency", "Velocity", velocities
-        )
-    with setup_columns[2]:
-        signal_column = st.selectbox(
-            "Signal",
-            AVAILABLE_COLUMNS,
-            index=None,
-            key="frequency_signal",
-            format_func=column_display_label,
-        )
-    with setup_columns[3]:
-        filter_settings = render_processing_controls(
-            "frequency", str(signal_column)
-        )
-    with setup_columns[4]:
-        peak_settings = render_peak_settings()
 
-    eligible = file_summary[
-        file_summary["material"].astype(str).isin(selected_materials)
-        & file_summary["velocity"].astype(str).isin(selected_velocities)
-    ]
+    with st.container(border=True, key="frequency_controls"):
+        st.markdown(
+            '<div class="plot-heading">Frequency controls</div>',
+            unsafe_allow_html=True,
+        )
 
-    plot_option_columns = st.columns(2, gap="small")
-    with plot_option_columns[0]:
-        individual_options = st.columns(
-            [2.25, 0.68],
+        data_columns = st.columns(
+            [0.42, 1, 1, 1.1],
             gap="small",
-            vertical_alignment="bottom",
+            vertical_alignment="center",
         )
-        with individual_options[0]:
+        with data_columns[0]:
+            render_frequency_row_label("Data")
+        with data_columns[1]:
+            selected_materials = render_filter_dropdown(
+                "frequency", "Material", materials
+            )
+        with data_columns[2]:
+            selected_velocities = render_filter_dropdown(
+                "frequency", "Velocity", velocities
+            )
+        eligible = file_summary[
+            file_summary["material"].astype(str).isin(selected_materials)
+            & file_summary["velocity"].astype(str).isin(selected_velocities)
+        ]
+        with data_columns[3]:
+            selected_files = render_file_selector("frequency", eligible)
+
+        analysis_columns = st.columns(
+            [0.42, 1, 1, 1.1],
+            gap="small",
+            vertical_alignment="center",
+        )
+        with analysis_columns[0]:
+            render_frequency_row_label("Analysis")
+        with analysis_columns[1]:
+            signal_column = st.selectbox(
+                "Signal",
+                AVAILABLE_COLUMNS,
+                index=None,
+                key="frequency_signal",
+                label_visibility="collapsed",
+                format_func=lambda value: (
+                    f"Signal: {column_display_label(value)}"
+                ),
+            )
+        with analysis_columns[2]:
+            filter_settings = render_processing_controls(
+                "frequency", str(signal_column)
+            )
+        with analysis_columns[3]:
+            peak_settings = render_peak_settings()
+
+        plot_columns = st.columns(
+            [0.42, 2.15, 0.65, 2.15, 0.65, 0.9],
+            gap="small",
+            vertical_alignment="center",
+        )
+        with plot_columns[0]:
+            render_frequency_row_label("Plots")
+        with plot_columns[1]:
             individual_plot = st.selectbox(
                 "Individual plot",
                 ["FFT", "PSD", "Energy by frequency band"],
                 index=None,
                 key="frequency_individual_plot",
+                label_visibility="collapsed",
+                format_func=lambda value: f"Individual: {value}",
             )
-        with individual_options[1]:
+        with plot_columns[2]:
             (
                 show_peaks,
                 show_legend,
@@ -3790,13 +3844,7 @@ def render_frequency_workspace(
             ) = render_frequency_individual_view_controls(
                 str(individual_plot)
             )
-    with plot_option_columns[1]:
-        summary_options = st.columns(
-            [2.25, 0.68],
-            gap="small",
-            vertical_alignment="bottom",
-        )
-        with summary_options[0]:
+        with plot_columns[3]:
             summary_plot = st.selectbox(
                 "Summary plot",
                 [
@@ -3806,26 +3854,22 @@ def render_frequency_workspace(
                 ],
                 index=None,
                 key="frequency_summary_plot",
+                label_visibility="collapsed",
+                format_func=lambda value: f"Summary: {value}",
             )
-        with summary_options[1]:
+        with plot_columns[4]:
             summary_x_scale, summary_y_scale = render_frequency_axis_controls(
                 "frequency_summary", str(summary_plot)
             )
-
-    selection_columns = st.columns(
-        [5.4, 0.9], gap="small", vertical_alignment="top"
-    )
-    with selection_columns[0]:
-        selected_files = render_file_selector("frequency", eligible)
-    with selection_columns[1]:
-        update_requested = st.button(
-            "Update",
-            key="frequency_update",
-            type="primary",
-            icon=":material/refresh:",
-            width="stretch",
-            help="Apply all frequency-analysis controls.",
-        )
+        with plot_columns[5]:
+            update_requested = st.button(
+                "Update",
+                key="frequency_update",
+                type="primary",
+                icon=":material/refresh:",
+                width="stretch",
+                help="Apply all frequency-analysis controls.",
+            )
 
     draft_request = FrequencyRequest(
         selected_files=tuple(selected_files),
@@ -3884,7 +3928,6 @@ def render_frequency_workspace(
         "frequency-batch", signature, applied_request,
     )
     render_background_frequency(job_key, data, applied_request, labels)
-
 
 def render_peak_settings() -> tuple[float, float, int, int, int]:
     defaults = {
