@@ -53,6 +53,34 @@ streamlit run vader_dashboard.py
 
 It still requires the packages listed in `requirements.txt` to be installed.
 
+## One-file architecture
+
+The standalone file is divided by two large markers:
+
+    PHYSICS, RHEOLOGY, AND SIGNAL PROCESSING (EXPERT EDIT ZONE)
+    STREAMLIT FRONTEND / GUI (APPLICATION LAYER)
+
+Scientific contributors work only above the frontend marker. The Streamlit code
+below it reads shared registries, so the application still runs from one Python
+file without duplicating scientific definitions in the GUI.
+
+The main extension points are:
+
+- `PhysicalSettings` and `PHYSICS_CONTROL_SPECS`: add a physical parameter and
+  its generated Physics control.
+- `CUSTOM_DERIVED_QUANTITIES` and `add_custom_derived_columns()`: register and
+  calculate a new constitutive or derived quantity. Its axis label, unit, and
+  log-axis default then become available to the plots automatically.
+- `CUSTOM_FILTER_CONTROL_SPECS` and `CUSTOM_FILTER_EXECUTORS`: register a new
+  smoother/filter, its formula aliases and parameters, and its numerical
+  implementation. The formula parser and Add filter panel use the registry
+  automatically.
+
+Built-in equations, preprocessing, smoothing, filtering, FFT, PSD, and energy
+analysis also remain together in that expert zone. GUI request state, layouts,
+widgets, Plotly rendering, styling, and navigation remain below the frontend
+marker.
+
 ## Interface
 
 - A fixed icon rail switches between Filtered / processed, Raw data, Frequency analysis, and Summary plots.

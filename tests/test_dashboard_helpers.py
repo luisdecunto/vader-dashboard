@@ -1,6 +1,12 @@
 import unittest
+from dataclasses import fields
 
 from vader_dashboard import (
+    DERIVED_COLUMNS,
+    DERIVED_QUANTITY_DEFINITIONS,
+    FILTER_CONTROL_SPECS,
+    PHYSICS_CONTROL_SPECS,
+    PhysicalSettings,
     VELOCITY_COLUMN,
     column_axis_title,
     column_display_label,
@@ -9,6 +15,29 @@ from vader_dashboard import (
     parse_velocity_value,
     sorted_velocity_values,
 )
+
+
+class ExpertLayerRegistryTests(unittest.TestCase):
+    def test_physics_controls_cover_every_setting(self) -> None:
+        setting_fields = {field.name for field in fields(PhysicalSettings)}
+        control_fields = {
+            specification.field_name
+            for specification in PHYSICS_CONTROL_SPECS
+        }
+        self.assertEqual(control_fields, setting_fields)
+
+    def test_derived_columns_and_filter_labels_come_from_registries(self) -> None:
+        self.assertEqual(
+            DERIVED_COLUMNS,
+            [
+                definition.column
+                for definition in DERIVED_QUANTITY_DEFINITIONS
+            ],
+        )
+        self.assertEqual(
+            [specification.ui_label for specification in FILTER_CONTROL_SPECS],
+            ["MA", "LP", "HP", "SG", "WH", "Notch"],
+        )
 
 
 class DashboardDisplayTests(unittest.TestCase):

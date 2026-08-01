@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from analysis import (
+from vader_dashboard import (
     FilterSettings,
     PhysicalSettings,
     add_derived_columns,

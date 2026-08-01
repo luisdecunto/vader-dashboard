@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -25,84 +26,24 @@ from scipy.signal import (
 from scipy.sparse.linalg import spsolve
 
 
-DERIVED_COLUMNS = [
-    "area_mm2",
-    "stress_Pa",
-    "surface_tension_stress_Pa",
-    "net_stress_Pa",
-    "hencky_strain",
-    "hencky_strain_rate_1_s",
-    "extensional_viscosity_Pa_s",
-]
+# =============================================================================
+# PHYSICS, RHEOLOGY, AND SIGNAL PROCESSING (EXPERT EDIT ZONE)
+# =============================================================================
+# Everything from here to the STREAMLIT FRONTEND / GUI marker belongs to the
+# scientific layer. Physics contributors should only need to work in this zone.
+#
+# Extension points:
+#   1. Physical inputs: PhysicalSettings + PHYSICS_CONTROL_SPECS.
+#   2. Derived/constitutive quantities: CUSTOM_DERIVED_QUANTITIES +
+#      add_custom_derived_columns().
+#   3. Filters/smoothers: CUSTOM_FILTER_CONTROL_SPECS +
+#      CUSTOM_FILTER_EXECUTORS.
+
 MEASURED_PROCESS_COLUMNS = ("force_g", "radial_Hencky_strain")
 VARIANT_COLUMN = "processing_variant"
 TRACE_COLUMN = "trace_id"
-LOG_Y_COLUMNS = {"extensional_viscosity_Pa_s"}
 VELOCITY_COLUMN = "velocity_mm_s"
-IFF_PALETTE = (
-    "#0075CF",
-    "#00A6A6",
-    "#6F52A2",
-    "#E69F00",
-    "#2E8B57",
-    "#56B4E9",
-    "#8C6D31",
-    "#6B7280",
-    "#C58AF9",
-    "#009E73",
-)
-COLUMN_DISPLAY_LABELS = {
-    "time_from_onset_s": "Time from onset",
-    "vertical_distance_L": "Vertical distance",
-    "radial_Hencky_strain": "HS strain",
-    "vertical_strain": "Vertical strain",
-    "D_over_D0": "D / D0",
-    "force_g": "Force",
-    "diameter_mm": "Diameter",
-    VELOCITY_COLUMN: "Velocity",
-    "area_mm2": "Area",
-    "stress_Pa": "Stress",
-    "surface_tension_stress_Pa": "Surface-tension stress",
-    "net_stress_Pa": "Net stress",
-    "hencky_strain": "HS strain (derived)",
-    "hencky_strain_rate_1_s": "HS strain rate",
-    "extensional_viscosity_Pa_s": "Extensional viscosity",
-}
-COLUMN_AXIS_SYMBOLS = {
-    "time_from_onset_s": "<i>t</i>",
-    "vertical_distance_L": "<i>L</i><sub>v</sub>",
-    "radial_Hencky_strain": "ε<sub>HS</sub>",
-    "vertical_strain": "ε<sub>z</sub>",
-    "D_over_D0": "<i>D</i>/<i>D</i><sub>0</sub>",
-    "force_g": "<i>F</i>",
-    "diameter_mm": "<i>D</i>",
-    VELOCITY_COLUMN: "<i>v</i>",
-    "area_mm2": "<i>A</i>",
-    "stress_Pa": "σ",
-    "surface_tension_stress_Pa": "σ<sub>γ</sub>",
-    "net_stress_Pa": "σ<sub>net</sub>",
-    "hencky_strain": "ε<sub>HS</sub>",
-    "hencky_strain_rate_1_s": "ε̇<sub>HS</sub>",
-    "extensional_viscosity_Pa_s": "η<sub>E</sub>",
-}
 
-COLUMN_UNITS = {
-    "time_from_onset_s": "s",
-    "vertical_distance_L": "-",
-    "radial_Hencky_strain": "-",
-    "vertical_strain": "-",
-    "D_over_D0": "-",
-    "force_g": "g",
-    "diameter_mm": "mm",
-    VELOCITY_COLUMN: "mm s<sup>-1</sup>",
-    "area_mm2": "mm<sup>2</sup>",
-    "stress_Pa": "Pa",
-    "surface_tension_stress_Pa": "Pa",
-    "net_stress_Pa": "Pa",
-    "hencky_strain": "-",
-    "hencky_strain_rate_1_s": "s<sup>-1</sup>",
-    "extensional_viscosity_Pa_s": "Pa s",
-}
 
 @dataclass(frozen=True)
 class PhysicalSettings:
@@ -116,6 +57,216 @@ class PhysicalSettings:
     crop_min_time_s: float = 0.0001
     force_tail_offset_enabled: bool = True
 
+
+@dataclass(frozen=True)
+class PhysicsControlSpec:
+    field_name: str
+    label: str
+    control: str
+    key: str
+    group: str
+    min_value: float | int | None = None
+    max_value: float | int | None = None
+    step: float | int | None = None
+    number_format: str | None = None
+    help: str | None = None
+    options: tuple[str, ...] = ()
+    format_options_as_columns: bool = False
+
+
+# Add a PhysicalSettings field and one matching item here. The Physics popover
+# will create the control and pass its value into the scientific calculations.
+PHYSICS_CONTROL_SPECS = (
+    PhysicsControlSpec(
+        "surface_tension_mN_m",
+        "Surface tension (mN/m)",
+        "number",
+        "physics_surface_tension",
+        "Physics",
+        min_value=0.0,
+        step=1.0,
+    ),
+    PhysicsControlSpec(
+        "capillary_factor",
+        "Capillary factor",
+        "number",
+        "physics_capillary_factor",
+        "Physics",
+        min_value=0.0,
+        step=0.1,
+        help="Surface-tension stress = factor x gamma / diameter.",
+    ),
+    PhysicsControlSpec(
+        "force_zero_g",
+        "Force zero (g)",
+        "number",
+        "physics_force_zero",
+        "Physics",
+        step=0.1,
+        help="force_g is treated as gram-force and converted to newtons.",
+    ),
+    PhysicsControlSpec(
+        "min_abs_strain_rate",
+        "Minimum |strain rate| (1/s)",
+        "number",
+        "physics_min_rate",
+        "Physics",
+        min_value=1e-9,
+        number_format="%.2e",
+        help="Viscosity is empty below this magnitude.",
+    ),
+    PhysicsControlSpec(
+        "crop_enabled",
+        "Crop experiments",
+        "toggle",
+        "physics_crop_enabled",
+        "Preprocessing",
+    ),
+    PhysicsControlSpec(
+        "crop_strain_column",
+        "Crop strain",
+        "select",
+        "physics_crop_strain_column",
+        "Preprocessing",
+        options=("radial_Hencky_strain", "vertical_strain"),
+        format_options_as_columns=True,
+    ),
+    PhysicsControlSpec(
+        "crop_threshold",
+        "Crop threshold",
+        "number",
+        "physics_crop_threshold",
+        "Preprocessing",
+    ),
+    PhysicsControlSpec(
+        "crop_min_time_s",
+        "Minimum time (s)",
+        "number",
+        "physics_crop_min_time",
+        "Preprocessing",
+        min_value=0.0,
+        number_format="%.4f",
+    ),
+    PhysicsControlSpec(
+        "force_tail_offset_enabled",
+        "Tail force offset",
+        "toggle",
+        "physics_force_tail_offset",
+        "Preprocessing",
+        help=(
+            "Subtract the mean force where crop strain is at or above "
+            "the threshold."
+        ),
+    ),
+)
+PHYSICS_PANEL_CAPTION = (
+    "Stress = force / area. Net stress subtracts capillary stress. "
+    "Extensional viscosity = net stress / HS strain rate."
+)
+
+
+@dataclass(frozen=True)
+class DerivedQuantityDefinition:
+    column: str
+    display_label: str
+    axis_symbol: str
+    unit: str
+    log_y: bool = False
+
+
+BUILTIN_DERIVED_QUANTITIES = (
+    DerivedQuantityDefinition("area_mm2", "Area", "<i>A</i>", "mm<sup>2</sup>"),
+    DerivedQuantityDefinition("stress_Pa", "Stress", "\u03c3", "Pa"),
+    DerivedQuantityDefinition(
+        "surface_tension_stress_Pa",
+        "Surface-tension stress",
+        "\u03c3<sub>\u03b3</sub>",
+        "Pa",
+    ),
+    DerivedQuantityDefinition(
+        "net_stress_Pa", "Net stress", "\u03c3<sub>net</sub>", "Pa"
+    ),
+    DerivedQuantityDefinition(
+        "hencky_strain", "HS strain (derived)", "\u03b5<sub>HS</sub>", "-"
+    ),
+    DerivedQuantityDefinition(
+        "hencky_strain_rate_1_s",
+        "HS strain rate",
+        "\u03b5\u0307<sub>HS</sub>",
+        "s<sup>-1</sup>",
+    ),
+    DerivedQuantityDefinition(
+        "extensional_viscosity_Pa_s",
+        "Extensional viscosity",
+        "\u03b7<sub>E</sub>",
+        "Pa s",
+        log_y=True,
+    ),
+)
+
+# Add metadata for colleague-defined constitutive quantities here, then compute
+# the matching columns in add_custom_derived_columns() below.
+CUSTOM_DERIVED_QUANTITIES: tuple[DerivedQuantityDefinition, ...] = ()
+DERIVED_QUANTITY_DEFINITIONS = (
+    *BUILTIN_DERIVED_QUANTITIES,
+    *CUSTOM_DERIVED_QUANTITIES,
+)
+DERIVED_COLUMNS = [
+    definition.column for definition in DERIVED_QUANTITY_DEFINITIONS
+]
+LOG_Y_COLUMNS = {
+    definition.column
+    for definition in DERIVED_QUANTITY_DEFINITIONS
+    if definition.log_y
+}
+
+COLUMN_DISPLAY_LABELS = {
+    "time_from_onset_s": "Time from onset",
+    "vertical_distance_L": "Vertical distance",
+    "radial_Hencky_strain": "HS strain",
+    "vertical_strain": "Vertical strain",
+    "D_over_D0": "D / D0",
+    "force_g": "Force",
+    "diameter_mm": "Diameter",
+    VELOCITY_COLUMN: "Velocity",
+}
+COLUMN_AXIS_SYMBOLS = {
+    "time_from_onset_s": "<i>t</i>",
+    "vertical_distance_L": "<i>L</i><sub>v</sub>",
+    "radial_Hencky_strain": "\u03b5<sub>HS</sub>",
+    "vertical_strain": "\u03b5<sub>z</sub>",
+    "D_over_D0": "<i>D</i>/<i>D</i><sub>0</sub>",
+    "force_g": "<i>F</i>",
+    "diameter_mm": "<i>D</i>",
+    VELOCITY_COLUMN: "<i>v</i>",
+}
+COLUMN_UNITS = {
+    "time_from_onset_s": "s",
+    "vertical_distance_L": "-",
+    "radial_Hencky_strain": "-",
+    "vertical_strain": "-",
+    "D_over_D0": "-",
+    "force_g": "g",
+    "diameter_mm": "mm",
+    VELOCITY_COLUMN: "mm s<sup>-1</sup>",
+}
+for _definition in DERIVED_QUANTITY_DEFINITIONS:
+    COLUMN_DISPLAY_LABELS[_definition.column] = _definition.display_label
+    COLUMN_AXIS_SYMBOLS[_definition.column] = _definition.axis_symbol
+    COLUMN_UNITS[_definition.column] = _definition.unit
+
+
+def add_custom_derived_columns(
+    data: pd.DataFrame,
+    settings: PhysicalSettings,
+) -> pd.DataFrame:
+    """Compute columns declared in CUSTOM_DERIVED_QUANTITIES.
+
+    Keep custom constitutive equations here. Return the same frame with the new
+    columns added. The default implementation intentionally changes nothing.
+    """
+    del settings
+    return data
 
 @dataclass(frozen=True)
 class FilterStep:
@@ -157,63 +308,206 @@ class FormulaVariant:
 
 
 @dataclass(frozen=True)
-class PlotRequest:
-    x_column: str
-    y_column: str
-    selected_files: tuple[str, ...]
-    force_variants: tuple[FormulaVariant, ...]
-    strain_variants: tuple[FormulaVariant, ...]
-    show_raw_overlay: bool
-    show_legend: bool
-    x_scale: str
-    y_scale: str
-    selected_materials: tuple[str, ...]
-    selected_velocities: tuple[str, ...]
-    physical_settings: PhysicalSettings
+class FilterParameterSpec:
+    name: str
+    label: str
+    key_suffix: str
+    default: float
+    min_value: float | None = None
+    max_value: float | None = None
+    step: float = 1.0
+    integer: bool = False
 
 
 @dataclass(frozen=True)
-class SummaryRequest:
-    selected_files: tuple[str, ...]
-    x_column: str
-    y_column: str
-    group_by: str
-    bin_count: int
-    show_legend: bool
-    x_scale: str
-    y_scale: str
-    selected_materials: tuple[str, ...]
-    selected_velocities: tuple[str, ...]
-    physical_settings: PhysicalSettings
+class FilterControlSpec:
+    ui_label: str
+    operation: str
+    formula_name: str
+    aliases: tuple[str, ...]
+    parameters: tuple[FilterParameterSpec, ...]
+    minimum_parameters: int = 0
+    omit_default_parameters: bool = True
+    workflow_style: str = "call"
 
 
-@dataclass(frozen=True)
-class FrequencyRequest:
-    selected_files: tuple[str, ...]
-    signal_column: str
-    filter_settings: FilterSettings
-    peak_settings: tuple[float, float, int, int, int]
-    individual_plot: str
-    summary_plot: str
-    show_peaks: bool
-    show_legend: bool
-    individual_x_scale: str
-    individual_y_scale: str
-    summary_x_scale: str
-    summary_y_scale: str
-    selected_materials: tuple[str, ...]
-    selected_velocities: tuple[str, ...]
-    physical_settings: PhysicalSettings
+BUILTIN_FILTER_CONTROL_SPECS = (
+    FilterControlSpec(
+        "MA",
+        "moving_average",
+        "MA",
+        ("MA", "MOVINGAVERAGE"),
+        (
+            FilterParameterSpec(
+                "window_samples",
+                "Window (samples)",
+                "ma_window",
+                21.0,
+                min_value=1.0,
+                step=2.0,
+                integer=True,
+            ),
+        ),
+        workflow_style="compact",
+    ),
+    FilterControlSpec(
+        "LP",
+        "lowpass",
+        "LP",
+        ("LP", "LOWPASS"),
+        (
+            FilterParameterSpec(
+                "cutoff_hz",
+                "Cutoff (Hz)",
+                "lp_cutoff",
+                20.0,
+                min_value=0.001,
+                step=0.1,
+            ),
+        ),
+        minimum_parameters=1,
+        omit_default_parameters=False,
+        workflow_style="compact",
+    ),
+    FilterControlSpec(
+        "HP",
+        "highpass",
+        "HP",
+        ("HP", "HIGHPASS"),
+        (
+            FilterParameterSpec(
+                "cutoff_hz",
+                "Cutoff (Hz)",
+                "hp_cutoff",
+                0.1,
+                min_value=0.001,
+                step=0.1,
+            ),
+        ),
+        minimum_parameters=1,
+        omit_default_parameters=False,
+        workflow_style="compact",
+    ),
+    FilterControlSpec(
+        "SG",
+        "savgol",
+        "SG",
+        ("SG", "SAVGOL"),
+        (
+            FilterParameterSpec(
+                "window_samples",
+                "Window",
+                "sg_window",
+                21.0,
+                min_value=3.0,
+                step=2.0,
+                integer=True,
+            ),
+            FilterParameterSpec(
+                "polynomial_order",
+                "Order",
+                "sg_order",
+                3.0,
+                min_value=1.0,
+                step=1.0,
+                integer=True,
+            ),
+        ),
+    ),
+    FilterControlSpec(
+        "WH",
+        "whittaker",
+        "WH",
+        ("WH", "WHITTAKER"),
+        (
+            FilterParameterSpec(
+                "smoothing_lambda",
+                "Lambda",
+                "wh_lambda",
+                1_000.0,
+                min_value=0.0,
+                step=100.0,
+            ),
+        ),
+        workflow_style="compact",
+    ),
+    FilterControlSpec(
+        "Notch",
+        "notch",
+        "NOTCH",
+        ("NT", "NOTCH"),
+        (
+            FilterParameterSpec(
+                "minimum_hz",
+                "Minimum (Hz)",
+                "notch_min",
+                0.5,
+                min_value=0.0,
+                step=0.1,
+            ),
+            FilterParameterSpec(
+                "maximum_hz",
+                "Maximum (Hz)",
+                "notch_max",
+                10.0,
+                min_value=0.001,
+                step=0.5,
+            ),
+            FilterParameterSpec(
+                "peak_count",
+                "Peaks",
+                "notch_count",
+                3.0,
+                min_value=1.0,
+                max_value=10.0,
+                step=1.0,
+                integer=True,
+            ),
+            FilterParameterSpec(
+                "quality_factor",
+                "Q",
+                "notch_q",
+                30.0,
+                min_value=1.0,
+                step=1.0,
+            ),
+        ),
+    ),
+)
 
+# Add colleague-defined filter metadata here. The formula parser and the
+# Streamlit Add filter panel both use this registry.
+CUSTOM_FILTER_CONTROL_SPECS: tuple[FilterControlSpec, ...] = ()
+FILTER_CONTROL_SPECS = (
+    *BUILTIN_FILTER_CONTROL_SPECS,
+    *CUSTOM_FILTER_CONTROL_SPECS,
+)
+FILTER_SPEC_BY_LABEL = {
+    specification.ui_label: specification
+    for specification in FILTER_CONTROL_SPECS
+}
+FILTER_SPEC_BY_OPERATION = {
+    specification.operation: specification
+    for specification in FILTER_CONTROL_SPECS
+}
+FILTER_SPEC_BY_ALIAS = {
+    alias.upper(): specification
+    for specification in FILTER_CONTROL_SPECS
+    for alias in specification.aliases
+}
+
+CustomFilterExecutor = Callable[
+    [np.ndarray, tuple[float, ...], float, float, list[str]],
+    np.ndarray,
+]
+# Register custom numerical implementations by operation name. Built-in
+# implementations remain in _apply_filter_steps() below.
+CUSTOM_FILTER_EXECUTORS: dict[str, CustomFilterExecutor] = {}
 
 def column_display_label(column: str) -> str:
     return COLUMN_DISPLAY_LABELS.get(column, column)
 
 
-def column_axis_title(column: str) -> str:
-    symbol = COLUMN_AXIS_SYMBOLS.get(column, column)
-    unit = COLUMN_UNITS.get(column, "-")
-    return f"{symbol} [{unit}]"
 
 def formula_source_label(source_column: str) -> str:
     return "HS" if source_column == "radial_Hencky_strain" else source_column
@@ -227,29 +521,6 @@ def canonical_formula_source(source_name: str) -> str:
     )
 
 
-def parse_velocity_value(value: Any) -> float:
-    match = re.search(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", str(value))
-    return float(match.group(0)) if match else float("nan")
-
-
-def velocity_sort_key(value: Any) -> tuple[int, float, str]:
-    numeric = parse_velocity_value(value)
-    if np.isfinite(numeric):
-        return (0, numeric, str(value).casefold())
-    return (1, float("inf"), str(value).casefold())
-
-
-def sorted_velocity_values(values: Any) -> list[str]:
-    return sorted(
-        {str(value) for value in values if pd.notna(value)},
-        key=velocity_sort_key,
-    )
-
-
-def normalize_axis_scale(value: str) -> str:
-    return "log" if str(value).lower() == "log" else "linear"
-
-
 def parse_filter_workflow(expression: str) -> tuple[FilterStep, ...]:
     text = re.sub(r"\s+", "", expression).upper()
     if text in {"", "RAW", "NONE"}:
@@ -260,21 +531,22 @@ def parse_filter_workflow(expression: str) -> tuple[FilterStep, ...]:
 def format_filter_workflow(steps: tuple[FilterStep, ...]) -> str:
     labels: list[str] = []
     for step in steps:
-        values = step.parameters
-        if step.operation == "lowpass":
-            labels.append(f"LP{values[0]:g}")
-        elif step.operation == "highpass":
-            labels.append(f"HP{values[0]:g}")
-        elif step.operation == "moving_average":
-            labels.append(f"MA{int(values[0])}")
-        elif step.operation == "savgol":
-            labels.append(f"SG({int(values[0])},{int(values[1])})")
-        elif step.operation == "whittaker":
-            labels.append(f"WH{values[0]:g}")
-        elif step.operation == "notch":
-            labels.append("NOTCH(" + ",".join(f"{value:g}" for value in values) + ")")
+        specification = FILTER_SPEC_BY_OPERATION.get(step.operation)
+        formula_name = (
+            specification.formula_name
+            if specification is not None
+            else step.operation.upper()
+        )
+        parameters = ",".join(f"{value:g}" for value in step.parameters)
+        if (
+            specification is not None
+            and specification.workflow_style == "compact"
+            and len(step.parameters) == 1
+        ):
+            labels.append(f"{formula_name}{parameters}")
+        else:
+            labels.append(f"{formula_name}({parameters})")
     return " > ".join(labels) if labels else "Raw"
-
 
 def parse_filter_formula(expression: str) -> tuple[str, tuple[FilterStep, ...]]:
     text = re.sub(r"\s+", "", expression)
@@ -289,31 +561,29 @@ def format_filter_formula(
 ) -> str:
     formula = source_column
     for step in steps:
-        values = step.parameters
-        if step.operation == "moving_average":
-            suffix = "" if int(values[0]) == 21 else f",{int(values[0])}"
-            formula = f"MA({formula}{suffix})"
-        elif step.operation == "lowpass":
-            formula = f"LP({formula},{values[0]:g})"
-        elif step.operation == "highpass":
-            formula = f"HP({formula},{values[0]:g})"
-        elif step.operation == "savgol":
-            suffix = (
-                "" if (int(values[0]), int(values[1])) == (21, 3)
-                else f",{int(values[0])},{int(values[1])}"
+        specification = FILTER_SPEC_BY_OPERATION.get(step.operation)
+        formula_name = (
+            specification.formula_name
+            if specification is not None
+            else step.operation.upper()
+        )
+        defaults = (
+            tuple(parameter.default for parameter in specification.parameters)
+            if specification is not None
+            else ()
+        )
+        omit_parameters = (
+            specification is not None
+            and specification.omit_default_parameters
+            and step.parameters == defaults
+        )
+        suffix = ""
+        if not omit_parameters:
+            suffix = "," + ",".join(
+                f"{value:g}" for value in step.parameters
             )
-            formula = f"SG({formula}{suffix})"
-        elif step.operation == "whittaker":
-            suffix = "" if values[0] == 1_000 else f",{values[0]:g}"
-            formula = f"WH({formula}{suffix})"
-        elif step.operation == "notch":
-            defaults = (0.5, 10.0, 3.0, 30.0)
-            suffix = "" if values == defaults else "," + ",".join(
-                f"{value:g}" for value in values
-            )
-            formula = f"NOTCH({formula}{suffix})"
+        formula = f"{formula_name}({formula}{suffix})"
     return formula
-
 
 
 def parse_filter_formula_list(
@@ -368,7 +638,10 @@ def expand_filter_formula_shorthand(expression: str, source_column: str) -> str:
         return text
 
     number = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
-    functions = "LP|LOWPASS|HP|HIGHPASS|MA|MOVINGAVERAGE|SG|SAVGOL|WH|WHITTAKER|NT|NOTCH"
+    functions = "|".join(
+        re.escape(alias)
+        for alias in sorted(FILTER_SPEC_BY_ALIAS, key=len, reverse=True)
+    )
     pattern = re.compile(rf"\b({functions})\(({number}(?:,{number})*)\)", re.IGNORECASE)
     while True:
         expanded = pattern.sub(
@@ -397,46 +670,26 @@ def _parse_filter_formula_node(expression: str) -> tuple[str, tuple[FilterStep, 
     except ValueError as exc:
         raise ValueError(f"{function_name} parameters must be numbers.") from exc
 
-    operation = {
-        "MA": "moving_average", "MOVINGAVERAGE": "moving_average",
-        "LP": "lowpass", "LOWPASS": "lowpass",
-        "HP": "highpass", "HIGHPASS": "highpass",
-        "SG": "savgol", "SAVGOL": "savgol",
-        "WH": "whittaker", "WHITTAKER": "whittaker",
-        "NT": "notch", "NOTCH": "notch",
-    }.get(function_name.upper())
-    if operation is None:
+    specification = FILTER_SPEC_BY_ALIAS.get(function_name.upper())
+    if specification is None:
         raise ValueError(f"Unknown filter function '{function_name}'.")
 
-    if operation == "moving_average":
-        if len(parameters) > 1:
-            raise ValueError("MA accepts an optional window.")
-        step = _validated_step(operation, parameters or (21.0,))
-    elif operation in {"lowpass", "highpass"}:
-        if len(parameters) != 1:
-            raise ValueError(f"{function_name.upper()} requires one cutoff frequency.")
-        step = _validated_step(operation, parameters)
-    elif operation == "savgol":
-        if len(parameters) > 2:
-            raise ValueError("SG accepts an optional window and polynomial order.")
-        window = parameters[0] if parameters else 21.0
-        order = parameters[1] if len(parameters) == 2 else 3.0
-        step = _validated_step(operation, (window, order))
-    elif operation == "whittaker":
-        if len(parameters) > 1:
-            raise ValueError("WH accepts an optional lambda.")
-        step = _validated_step(operation, parameters or (1_000.0,))
-    else:
-        if len(parameters) > 4:
-            raise ValueError("NOTCH accepts min, max, count, and Q parameters.")
-        minimum = parameters[0] if parameters else 0.5
-        maximum = parameters[1] if len(parameters) >= 2 else 10.0
-        count = parameters[2] if len(parameters) >= 3 else 3.0
-        quality = parameters[3] if len(parameters) == 4 else 30.0
-        step = _validated_step(
-            operation,
-            (minimum, maximum, count, quality),
+    maximum_parameters = len(specification.parameters)
+    if not specification.minimum_parameters <= len(parameters) <= maximum_parameters:
+        required = (
+            str(specification.minimum_parameters)
+            if specification.minimum_parameters == maximum_parameters
+            else f"{specification.minimum_parameters}-{maximum_parameters}"
         )
+        raise ValueError(
+            f"{function_name.upper()} accepts {required} parameter(s)."
+        )
+
+    defaults = tuple(
+        parameter.default for parameter in specification.parameters
+    )
+    complete_parameters = parameters + defaults[len(parameters):]
+    step = _validated_step(specification.operation, complete_parameters)
     return source_column, (*steps, step)
 
 
@@ -533,32 +786,21 @@ def _outer_workflow_call(term: str) -> tuple[str, str] | None:
 
 
 def _parse_parameter_call(head: str, argument: str) -> FilterStep | None:
-    aliases = {
-        "LP": "lowpass", "LOWPASS": "lowpass",
-        "HP": "highpass", "HIGHPASS": "highpass",
-        "MA": "moving_average", "MOVINGAVERAGE": "moving_average",
-        "SG": "savgol", "SAVGOL": "savgol",
-        "WH": "whittaker", "WHITTAKER": "whittaker",
-        "NT": "notch", "NOTCH": "notch",
-    }
-    operation = aliases.get(head)
-    if operation is None:
+    specification = FILTER_SPEC_BY_ALIAS.get(head.upper())
+    if specification is None:
         return None
     try:
         values = tuple(float(value) for value in argument.split(","))
     except ValueError:
         return None
-    if operation in {"lowpass", "highpass", "moving_average", "whittaker"} and len(values) == 1:
-        return _validated_step(operation, values)
-    if operation == "savgol" and len(values) in {1, 2}:
-        order = values[1] if len(values) == 2 else 3.0
-        return _validated_step(operation, (values[0], order))
-    if operation == "notch" and 2 <= len(values) <= 4:
-        count = values[2] if len(values) >= 3 else 3.0
-        quality = values[3] if len(values) == 4 else 30.0
-        return _validated_step(operation, (values[0], values[1], count, quality))
-    return None
-
+    maximum_parameters = len(specification.parameters)
+    if not specification.minimum_parameters <= len(values) <= maximum_parameters:
+        return None
+    defaults = tuple(
+        parameter.default for parameter in specification.parameters
+    )
+    complete_values = values + defaults[len(values):]
+    return _validated_step(specification.operation, complete_values)
 
 def _parse_compact_step(term: str) -> FilterStep:
     patterns = (
@@ -582,11 +824,36 @@ def _parse_compact_step(term: str) -> FilterStep:
 
 
 def _validated_step(operation: str, parameters: tuple[float, ...]) -> FilterStep:
+    specification = FILTER_SPEC_BY_OPERATION.get(operation)
+    if specification is not None:
+        if len(parameters) != len(specification.parameters):
+            raise ValueError(
+                f"{specification.formula_name} requires "
+                f"{len(specification.parameters)} normalized parameter(s)."
+            )
+        normalized: list[float] = []
+        for value, parameter in zip(parameters, specification.parameters):
+            if parameter.integer:
+                integer_value = int(value)
+                if not np.isclose(value, integer_value):
+                    raise ValueError(f"{parameter.label} must be an integer.")
+                value = float(integer_value)
+            if parameter.min_value is not None and value < parameter.min_value:
+                raise ValueError(
+                    f"{parameter.label} must be at least {parameter.min_value:g}."
+                )
+            if parameter.max_value is not None and value > parameter.max_value:
+                raise ValueError(
+                    f"{parameter.label} must be at most {parameter.max_value:g}."
+                )
+            normalized.append(float(value))
+        parameters = tuple(normalized)
+
     if operation in {"lowpass", "highpass"} and parameters[0] <= 0:
         raise ValueError("Filter cutoffs must be greater than zero.")
     if operation == "moving_average":
         window = int(parameters[0])
-        if window < 1 or not np.isclose(parameters[0], window):
+        if window < 1:
             raise ValueError("Moving-average windows must be positive integers.")
         parameters = (float(window),)
     elif operation == "savgol":
@@ -735,6 +1002,14 @@ def add_derived_columns(
     rate = result["hencky_strain_rate_1_s"]
     safe_rate = rate.where(rate.abs() >= settings.min_abs_strain_rate)
     result["extensional_viscosity_Pa_s"] = result["net_stress_Pa"] / safe_rate
+
+    result = add_custom_derived_columns(result, settings)
+    if not isinstance(result, pd.DataFrame):
+        raise TypeError("add_custom_derived_columns() must return a DataFrame.")
+    for definition in CUSTOM_DERIVED_QUANTITIES:
+        if definition.column not in result.columns:
+            result[definition.column] = np.nan
+
     result.replace([np.inf, -np.inf], np.nan, inplace=True)
     return result
 
@@ -1223,7 +1498,34 @@ def _apply_filter_steps(
                 except ValueError as exc:
                     warnings.append(f"notch at {peak_hz:.3g} Hz skipped ({exc})")
         else:
-            warnings.append(f"unknown workflow step '{step.operation}' skipped")
+            executor = CUSTOM_FILTER_EXECUTORS.get(step.operation)
+            if executor is None:
+                warnings.append(
+                    f"unknown workflow step '{step.operation}' skipped"
+                )
+                continue
+            try:
+                custom_values = np.asarray(
+                    executor(
+                        filtered,
+                        parameters,
+                        sample_rate,
+                        nyquist,
+                        warnings,
+                    ),
+                    dtype=float,
+                )
+            except Exception as exc:
+                warnings.append(
+                    f"custom filter '{step.operation}' skipped ({exc})"
+                )
+                continue
+            if custom_values.shape != filtered.shape:
+                warnings.append(
+                    f"custom filter '{step.operation}' returned the wrong shape"
+                )
+                continue
+            filtered = custom_values
     return filtered, notch_peaks
 
 
@@ -1297,7 +1599,10 @@ def _apply_savgol(
 def _unique_strings(values: list[str]) -> list[str]:
     return list(dict.fromkeys(values))
 
-# Streamlit application
+# =============================================================================
+# STREAMLIT FRONTEND / GUI (APPLICATION LAYER)
+# =============================================================================
+# Physics contributors should not need to edit anything below this line.
 
 import hashlib
 import math
@@ -1306,9 +1611,6 @@ import sys
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable
-
-import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
@@ -1351,6 +1653,98 @@ PROCESSED_DEFAULT_PLOTS = [
     {"x": "time_from_onset_s", "y": "force_g"},
     {"x": "radial_Hencky_strain", "y": "net_stress_Pa"},
 ]
+
+IFF_PALETTE = (
+    "#0075CF",
+    "#00A6A6",
+    "#6F52A2",
+    "#E69F00",
+    "#2E8B57",
+    "#56B4E9",
+    "#8C6D31",
+    "#6B7280",
+    "#C58AF9",
+    "#009E73",
+)
+
+
+@dataclass(frozen=True)
+class PlotRequest:
+    x_column: str
+    y_column: str
+    selected_files: tuple[str, ...]
+    force_variants: tuple[FormulaVariant, ...]
+    strain_variants: tuple[FormulaVariant, ...]
+    show_raw_overlay: bool
+    show_legend: bool
+    x_scale: str
+    y_scale: str
+    selected_materials: tuple[str, ...]
+    selected_velocities: tuple[str, ...]
+    physical_settings: PhysicalSettings
+
+
+@dataclass(frozen=True)
+class SummaryRequest:
+    selected_files: tuple[str, ...]
+    x_column: str
+    y_column: str
+    group_by: str
+    bin_count: int
+    show_legend: bool
+    x_scale: str
+    y_scale: str
+    selected_materials: tuple[str, ...]
+    selected_velocities: tuple[str, ...]
+    physical_settings: PhysicalSettings
+
+
+@dataclass(frozen=True)
+class FrequencyRequest:
+    selected_files: tuple[str, ...]
+    signal_column: str
+    filter_settings: FilterSettings
+    peak_settings: tuple[float, float, int, int, int]
+    individual_plot: str
+    summary_plot: str
+    show_peaks: bool
+    show_legend: bool
+    individual_x_scale: str
+    individual_y_scale: str
+    summary_x_scale: str
+    summary_y_scale: str
+    selected_materials: tuple[str, ...]
+    selected_velocities: tuple[str, ...]
+    physical_settings: PhysicalSettings
+
+
+def column_axis_title(column: str) -> str:
+    symbol = COLUMN_AXIS_SYMBOLS.get(column, column)
+    unit = COLUMN_UNITS.get(column, "-")
+    return f"{symbol} [{unit}]"
+
+
+def parse_velocity_value(value: Any) -> float:
+    match = re.search(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", str(value))
+    return float(match.group(0)) if match else float("nan")
+
+
+def velocity_sort_key(value: Any) -> tuple[int, float, str]:
+    numeric = parse_velocity_value(value)
+    if np.isfinite(numeric):
+        return (0, numeric, str(value).casefold())
+    return (1, float("inf"), str(value).casefold())
+
+
+def sorted_velocity_values(values: Any) -> list[str]:
+    return sorted(
+        {str(value) for value in values if pd.notna(value)},
+        key=velocity_sort_key,
+    )
+
+
+def normalize_axis_scale(value: str) -> str:
+    return "log" if str(value).lower() == "log" else "linear"
 
 
 
@@ -1786,75 +2180,75 @@ def render_navigation() -> str:
     return current
 
 def render_physical_settings() -> PhysicalSettings:
+    defaults = PhysicalSettings()
+    values: dict[str, Any] = {}
     with st.container(key="top_physical_settings"):
         with st.popover(
             "Physics",
             icon=":material/tune:",
             width="stretch",
         ):
-            surface_tension = st.number_input(
-                "Surface tension (mN/m)", min_value=0.0, value=72.0, step=1.0,
-                key="physics_surface_tension",
-            )
-            capillary_factor = st.number_input(
-                "Capillary factor", min_value=0.0, value=2.0, step=0.1,
-                key="physics_capillary_factor",
-                help="Surface-tension stress = factor x gamma / diameter.",
-            )
-            force_zero = st.number_input(
-                "Force zero (g)", value=0.0, step=0.1,
-                key="physics_force_zero",
-                help="force_g is treated as gram-force and converted to newtons.",
-            )
-            minimum_rate = st.number_input(
-                "Minimum |strain rate| (1/s)", min_value=1e-9, value=1e-5,
-                format="%.2e", key="physics_min_rate",
-                help="Viscosity is empty below this magnitude.",
-            )
-            st.divider()
-            crop_enabled = st.toggle(
-                "Crop experiments", value=True, key="physics_crop_enabled"
-            )
-            crop_strain_column = st.selectbox(
-                "Crop strain",
-                ["radial_Hencky_strain", "vertical_strain"],
-                key="physics_crop_strain_column",
-                format_func=column_display_label,
-            )
-            crop_threshold = st.number_input(
-                "Crop threshold", value=7.0, key="physics_crop_threshold"
-            )
-            crop_min_time = st.number_input(
-                "Minimum time (s)",
-                min_value=0.0,
-                value=0.0001,
-                format="%.4f",
-                key="physics_crop_min_time",
-            )
-            force_tail_offset = st.toggle(
-                "Tail force offset",
-                value=True,
-                key="physics_force_tail_offset",
-                help=(
-                    "Subtract the mean force where crop strain is at or above "
-                    "the threshold."
-                ),
-            )
-            st.caption(
-                "Stress = force / area. Net stress subtracts capillary stress. "
-                "Extensional viscosity = net stress / HS strain rate."
-            )
-    return PhysicalSettings(
-        surface_tension_mN_m=float(surface_tension),
-        capillary_factor=float(capillary_factor),
-        force_zero_g=float(force_zero),
-        min_abs_strain_rate=float(minimum_rate),
-        crop_enabled=bool(crop_enabled),
-        crop_strain_column=crop_strain_column,
-        crop_threshold=float(crop_threshold),
-        crop_min_time_s=float(crop_min_time),
-        force_tail_offset_enabled=bool(force_tail_offset),
-    )
+            current_group: str | None = None
+            for specification in PHYSICS_CONTROL_SPECS:
+                if (
+                    current_group is not None
+                    and specification.group != current_group
+                ):
+                    st.divider()
+                current_group = specification.group
+                default_value = getattr(defaults, specification.field_name)
+
+                if specification.control == "toggle":
+                    value = st.toggle(
+                        specification.label,
+                        value=bool(default_value),
+                        key=specification.key,
+                        help=specification.help,
+                    )
+                elif specification.control == "select":
+                    options = list(specification.options)
+                    if not options:
+                        raise ValueError(
+                            f"{specification.field_name} requires select options."
+                        )
+                    index = (
+                        options.index(default_value)
+                        if default_value in options
+                        else 0
+                    )
+                    select_arguments: dict[str, Any] = {
+                        "label": specification.label,
+                        "options": options,
+                        "index": index,
+                        "key": specification.key,
+                        "help": specification.help,
+                    }
+                    if specification.format_options_as_columns:
+                        select_arguments["format_func"] = column_display_label
+                    value = st.selectbox(**select_arguments)
+                elif specification.control == "number":
+                    number_arguments: dict[str, Any] = {
+                        "label": specification.label,
+                        "value": default_value,
+                        "key": specification.key,
+                        "help": specification.help,
+                    }
+                    if specification.min_value is not None:
+                        number_arguments["min_value"] = specification.min_value
+                    if specification.max_value is not None:
+                        number_arguments["max_value"] = specification.max_value
+                    if specification.step is not None:
+                        number_arguments["step"] = specification.step
+                    if specification.number_format is not None:
+                        number_arguments["format"] = specification.number_format
+                    value = st.number_input(**number_arguments)
+                else:
+                    raise ValueError(
+                        f"Unknown Physics control '{specification.control}'."
+                    )
+                values[specification.field_name] = value
+            st.caption(PHYSICS_PANEL_CAPTION)
+    return PhysicalSettings(**values)
 
 def get_data_signature(data_dir: Path) -> tuple[tuple[str, int, int], ...]:
     csv_paths = sorted(data_dir.glob("*.csv"))
@@ -2576,8 +2970,8 @@ def render_processing_controls(
 
         filter_name = st.segmented_control(
             "Add filter",
-            ["MA", "LP", "HP", "SG", "WH", "Notch"],
-            default="MA",
+            [specification.ui_label for specification in FILTER_CONTROL_SPECS],
+            default=FILTER_CONTROL_SPECS[0].ui_label,
             required=True,
             key=f"{scope}_new_filter",
             width="stretch",
@@ -2616,67 +3010,52 @@ def render_processing_controls(
 
 
 def render_filter_step_options(scope: str, filter_name: str) -> FilterStep | None:
-    if filter_name == "MA":
-        window = st.number_input(
-            "Window (samples)", min_value=1, value=21, step=2,
-            key=f"{scope}_ma_window",
-        )
-        return FilterStep("moving_average", (float(window),))
-    if filter_name in {"LP", "HP"}:
-        default = 20.0 if filter_name == "LP" else 0.1
-        cutoff = st.number_input(
-            "Cutoff (Hz)", min_value=0.001, value=default, step=0.1,
-            key=f"{scope}_{filter_name.lower()}_cutoff",
-        )
-        operation = "lowpass" if filter_name == "LP" else "highpass"
-        return FilterStep(operation, (float(cutoff),))
-    if filter_name == "SG":
-        columns = st.columns(2, gap="small")
-        window = columns[0].number_input(
-            "Window", min_value=3, value=21, step=2,
-            key=f"{scope}_sg_window",
-        )
-        order = columns[1].number_input(
-            "Order", min_value=1, value=3, step=1,
-            key=f"{scope}_sg_order",
-        )
-        if int(order) >= int(window):
-            st.error("SG order must be smaller than its window.")
-            return None
-        return FilterStep("savgol", (float(window), float(order)))
-    if filter_name == "WH":
-        smoothing_lambda = st.number_input(
-            "Lambda", min_value=0.0, value=1000.0, step=100.0,
-            key=f"{scope}_wh_lambda",
-        )
-        return FilterStep("whittaker", (float(smoothing_lambda),))
-
-    range_columns = st.columns(2, gap="small")
-    minimum = range_columns[0].number_input(
-        "Minimum (Hz)", min_value=0.0, value=0.5, step=0.1,
-        key=f"{scope}_notch_min",
-    )
-    maximum = range_columns[1].number_input(
-        "Maximum (Hz)", min_value=0.001, value=10.0, step=0.5,
-        key=f"{scope}_notch_max",
-    )
-    detail_columns = st.columns(2, gap="small")
-    count = detail_columns[0].number_input(
-        "Peaks", min_value=1, max_value=10, value=3, step=1,
-        key=f"{scope}_notch_count",
-    )
-    quality = detail_columns[1].number_input(
-        "Q", min_value=1.0, value=30.0, step=1.0,
-        key=f"{scope}_notch_q",
-    )
-    if float(maximum) <= float(minimum):
-        st.error("Notch maximum must be greater than its minimum.")
+    specification = FILTER_SPEC_BY_LABEL.get(filter_name)
+    if specification is None:
+        st.error(f"Unknown filter '{filter_name}'.")
         return None
-    return FilterStep(
-        "notch",
-        (float(minimum), float(maximum), float(count), float(quality)),
-    )
 
+    parameters: list[float] = []
+    input_columns = (
+        st.columns(2, gap="small")
+        if len(specification.parameters) > 1
+        else None
+    )
+    for index, parameter in enumerate(specification.parameters):
+        target = (
+            input_columns[index % len(input_columns)]
+            if input_columns is not None
+            else st
+        )
+        if parameter.integer:
+            input_arguments: dict[str, Any] = {
+                "label": parameter.label,
+                "value": int(parameter.default),
+                "step": int(parameter.step),
+                "key": f"{scope}_{parameter.key_suffix}",
+            }
+            if parameter.min_value is not None:
+                input_arguments["min_value"] = int(parameter.min_value)
+            if parameter.max_value is not None:
+                input_arguments["max_value"] = int(parameter.max_value)
+        else:
+            input_arguments = {
+                "label": parameter.label,
+                "value": float(parameter.default),
+                "step": float(parameter.step),
+                "key": f"{scope}_{parameter.key_suffix}",
+            }
+            if parameter.min_value is not None:
+                input_arguments["min_value"] = float(parameter.min_value)
+            if parameter.max_value is not None:
+                input_arguments["max_value"] = float(parameter.max_value)
+        parameters.append(float(target.number_input(**input_arguments)))
+
+    try:
+        return _validated_step(specification.operation, tuple(parameters))
+    except ValueError as exc:
+        st.error(str(exc))
+        return None
 
 def update_filter_formula(
     formula_key: str,
