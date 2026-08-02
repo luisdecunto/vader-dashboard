@@ -3150,11 +3150,14 @@ def render_file_selector(index: int | str, file_summary: pd.DataFrame) -> list[s
         bool(st.session_state[f"plot_{index}_file_{file_name}"])
         for file_name in files
     )
+    popover_key = f"plot_{index}_series_popover"
     with st.popover(
         f"Runs {selected_count}/{len(files)}",
         icon=":material/dataset:",
         help="Choose data series",
         width="stretch",
+        key=popover_key,
+        on_change="rerun",
     ):
         with st.form(f"plot_{index}_series_form", border=False):
             if files:
@@ -3191,6 +3194,8 @@ def render_file_selector(index: int | str, file_summary: pd.DataFrame) -> list[s
             action_columns[2].form_submit_button(
                 "Done",
                 type="primary",
+                on_click=close_runs_selector,
+                args=(popover_key,),
                 disabled=not files,
                 width="stretch",
             )
@@ -3200,6 +3205,11 @@ def render_file_selector(index: int | str, file_summary: pd.DataFrame) -> list[s
         for file_name in files
         if st.session_state[f"plot_{index}_file_{file_name}"]
     ]
+
+
+def close_runs_selector(popover_key: str) -> None:
+    st.session_state[popover_key] = False
+
 
 def set_file_selection(index: int | str, files: list[str], selected: bool) -> None:
     for file_name in files:
