@@ -8,7 +8,7 @@ or:
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 import numpy as np
@@ -548,11 +548,12 @@ def formula_source_label(source_column: str) -> str:
 
 
 def canonical_formula_source(source_name: str) -> str:
-    return (
-        "radial_Hencky_strain"
-        if source_name.upper() in {"HS", "HD"}
-        else source_name
-    )
+    aliases = {
+        "HS": "radial_Hencky_strain",
+        "HD": "radial_Hencky_strain",
+        "F": "force_g",
+    }
+    return aliases.get(source_name.upper(), source_name)
 
 
 def parse_filter_workflow(expression: str) -> tuple[FilterStep, ...]:
@@ -918,6 +919,16 @@ class PreprocessResult:
 
 
 @dataclass
+class PostprocessingAnalysis:
+    frame: pd.DataFrame
+    windows: dict[str, LinearRangeResult]
+    warnings: list[str]
+    window_starts: dict[str, tuple[int, float, float]] = field(
+        default_factory=dict
+    )
+
+
+@dataclass
 class FrequencyResult:
     frequency_hz: np.ndarray
     fft_amplitude: np.ndarray
@@ -1207,6 +1218,107 @@ def process_measured_variant_frames(
         warnings=_unique_strings(warnings),
     )
 
+
+def make_formula_variant(
+    source_column: str,
+    settings: FilterSettings,
+) -> FormulaVariant:
+    expression = format_filter_formula(
+        formula_source_label(source_column), settings.workflow
+    )
+    return FormulaVariant(
+        expression=expression,
+        label="Raw" if not settings.active else expression,
+        settings=settings,
+    )
+
+
+def analyze_postprocessing_runs(
+    frame: pd.DataFrame,
+    force_settings: FilterSettings,
+    strain_settings: FilterSettings,
+    y_column: str,
+    y_settings: FilterSettings,
+    physical_settings: PhysicalSettings,
+    r2_threshold: float,
+    min_points: int,
+    epsilon_start: float,
+) -> PostprocessingAnalysis:
+    """Process signals and locate each run's linear strain interval."""
+    if not np.isfinite(epsilon_start):
+        raise ValueError("The working-window start strain must be finite.")
+    processed = process_measured_variant_frame(
+        frame,
+        make_formula_variant("force_g", force_settings),
+        make_formula_variant("radial_Hencky_strain", strain_settings),
+        physical_settings,
+    )
+    analysis_frame = processed.frame
+    warnings = list(processed.warnings)
+    if y_column not in analysis_frame.columns:
+        raise ValueError(f"Unknown postprocessing variable: {y_column}")
+    if y_settings.active:
+        y_result = process_plot_frame(analysis_frame, y_column, y_settings)
+        output_column = f"{y_column}__processed"
+        analysis_frame = y_result.frame
+        analysis_frame[y_column] = analysis_frame[output_column]
+        analysis_frame = analysis_frame.drop(columns=[output_column])
+        warnings.extend(y_result.warnings)
+
+    windows: dict[str, LinearRangeResult] = {}
+    window_starts: dict[str, tuple[int, float, float]] = {}
+    for source_file, group in analysis_frame.groupby(
+        "source_file", sort=False
+    ):
+        ordered = group.sort_values("time_from_onset_s")
+        valid = ordered[[
+            "time_from_onset_s", "radial_Hencky_strain"
+        ]].dropna()
+        start_candidates = np.flatnonzero(
+            valid["radial_Hencky_strain"].to_numpy(dtype=float) >= epsilon_start
+        )
+        if not start_candidates.size:
+            windows[str(source_file)] = LinearRangeResult(
+                None, None, None, None, None
+            )
+            warnings.append(
+                f"{source_file}: no strain samples reached "
+                f"εᵣ,0 = {epsilon_start:g}"
+            )
+            continue
+
+        start_index = int(start_candidates[0])
+        candidates = valid.iloc[start_index:]
+        start_row = candidates.iloc[0]
+        window_starts[str(source_file)] = (
+            start_index,
+            float(start_row["time_from_onset_s"]),
+            float(start_row["radial_Hencky_strain"]),
+        )
+        try:
+            result = find_max_initial_linear_range(
+                candidates["time_from_onset_s"].to_numpy(dtype=float),
+                candidates["radial_Hencky_strain"].to_numpy(dtype=float),
+                r2_threshold=r2_threshold,
+                min_points=min_points,
+            )
+            if result.endpoint_index is not None:
+                result = replace(
+                    result,
+                    endpoint_index=start_index + result.endpoint_index,
+                )
+            windows[str(source_file)] = result
+        except ValueError as exc:
+            windows[str(source_file)] = LinearRangeResult(
+                None, None, None, None, None
+            )
+            warnings.append(f"{source_file}: working-window fit failed ({exc})")
+    return PostprocessingAnalysis(
+        frame=analysis_frame,
+        windows=windows,
+        warnings=_unique_strings(warnings),
+        window_starts=window_starts,
+    )
 
 def align_formula_variants(
     force_variants: tuple[FormulaVariant, ...],
@@ -1629,6 +1741,184 @@ def _apply_savgol(
     return savgol_filter(values, window_length=window, polyorder=polynomial_order)
 
 
+@dataclass(frozen=True)
+class LinearRangeResult:
+    """Result of the maximum-initial-linearity search."""
+
+    endpoint_index: int | None
+    endpoint_x: float | None
+    slope: float | None
+    intercept: float | None
+    r2: float | None
+    residuals: np.ndarray | None = None
+
+    @property
+    def valid(self) -> bool:
+        return self.endpoint_index is not None
+
+
+def find_max_initial_linear_range(
+    x: np.ndarray,
+    y: np.ndarray,
+    r2_threshold: float = 0.995,
+    constrain_to_first: bool = False,
+    min_points: int = 3,
+    include_residuals: bool = False,
+) -> LinearRangeResult:
+    """Find the longest initial interval that satisfies an R-squared limit.
+
+    Prefix sums make every candidate line fit an O(1) operation. After the
+    O(N) prefix preparation, the endpoint search evaluates O(log N) candidates.
+    The search assumes that the pass/fail criterion is monotonic as the initial
+    interval grows. ``constrain_to_first`` fits ``y = y0 + m * (x - x0)``;
+    otherwise an ordinary least-squares intercept is used.
+
+    Constant-y intervals are treated as perfectly linear when their residual
+    sum of squares is numerically zero, and as R-squared zero otherwise.
+
+    Example
+    -------
+    >>> x = np.arange(20, dtype=float)
+    >>> y = 2.0 * x + 1.0
+    >>> y[12:] += 3.0 * (x[12:] - 11.0) ** 2
+    >>> result = find_max_initial_linear_range(x, y, r2_threshold=0.999)
+    >>> result.valid and result.endpoint_index < len(x) - 1
+    True
+    """
+    x_values = np.asarray(x, dtype=float)
+    y_values = np.asarray(y, dtype=float)
+    if x_values.ndim != 1 or y_values.ndim != 1:
+        raise ValueError("x and y must be one-dimensional arrays.")
+    if x_values.size != y_values.size:
+        raise ValueError("x and y must contain the same number of points.")
+    if min_points < 2:
+        raise ValueError("min_points must be at least 2.")
+    if not np.isfinite(r2_threshold) or r2_threshold > 1.0:
+        raise ValueError("r2_threshold must be finite and no greater than 1.")
+    if not np.all(np.isfinite(x_values)) or not np.all(np.isfinite(y_values)):
+        raise ValueError("x and y must contain only finite values.")
+    if x_values.size > 1 and np.any(np.diff(x_values) <= 0):
+        raise ValueError("x must be strictly increasing with no duplicates.")
+    if x_values.size < min_points:
+        return LinearRangeResult(None, None, None, None, None)
+
+    def prefix(values: np.ndarray) -> np.ndarray:
+        return np.concatenate(([0.0], np.cumsum(values, dtype=float)))
+
+    prefix_x = prefix(x_values)
+    prefix_y = prefix(y_values)
+    prefix_xx = prefix(x_values * x_values)
+    prefix_xy = prefix(x_values * y_values)
+    prefix_yy = prefix(y_values * y_values)
+    delta_x = x_values - x_values[0]
+    delta_y = y_values - y_values[0]
+    prefix_dxx = prefix(delta_x * delta_x)
+    prefix_dxy = prefix(delta_x * delta_y)
+    prefix_dyy = prefix(delta_y * delta_y)
+    epsilon = np.finfo(float).eps
+
+    def fit(endpoint: int) -> tuple[float, float, float]:
+        count = endpoint + 1
+        sum_x = prefix_x[count]
+        sum_y = prefix_y[count]
+        sum_xx = prefix_xx[count]
+        sum_xy = prefix_xy[count]
+        sum_yy = prefix_yy[count]
+
+        if constrain_to_first:
+            denominator = prefix_dxx[count]
+            denominator_tolerance = 64.0 * epsilon * max(
+                1.0, abs(denominator)
+            )
+            if denominator <= denominator_tolerance:
+                raise ValueError("x values do not span a numerically stable range.")
+            slope = prefix_dxy[count] / denominator
+            intercept = y_values[0] - slope * x_values[0]
+            rss = (
+                prefix_dyy[count]
+                - 2.0 * slope * prefix_dxy[count]
+                + slope * slope * denominator
+            )
+        else:
+            denominator = sum_xx - sum_x * sum_x / count
+            denominator_tolerance = 64.0 * epsilon * max(
+                1.0, abs(sum_xx), abs(sum_x * sum_x / count)
+            )
+            if denominator <= denominator_tolerance:
+                raise ValueError("x values do not span a numerically stable range.")
+            slope = (sum_xy - sum_x * sum_y / count) / denominator
+            intercept = (sum_y - slope * sum_x) / count
+            rss = (
+                sum_yy
+                + slope * slope * sum_xx
+                + count * intercept * intercept
+                - 2.0 * slope * sum_xy
+                - 2.0 * intercept * sum_y
+                + 2.0 * slope * intercept * sum_x
+            )
+
+        rss_scale = max(
+            1.0,
+            abs(sum_yy),
+            abs(slope * slope * sum_xx),
+            abs(count * intercept * intercept),
+        )
+        rss_tolerance = 128.0 * epsilon * rss_scale
+        if abs(rss) <= rss_tolerance:
+            rss = 0.0
+        else:
+            rss = max(0.0, float(rss))
+
+        sst = sum_yy - sum_y * sum_y / count
+        sst_scale = max(1.0, abs(sum_yy), abs(sum_y * sum_y / count))
+        sst_tolerance = 128.0 * epsilon * sst_scale
+        if sst <= sst_tolerance:
+            r2 = 1.0 if rss <= rss_tolerance else 0.0
+        else:
+            r2 = 1.0 - rss / sst
+        return float(slope), float(intercept), float(r2)
+
+    def finish(
+        endpoint: int,
+        final_fit: tuple[float, float, float],
+    ) -> LinearRangeResult:
+        slope, intercept, r2 = final_fit
+        residuals = None
+        if include_residuals:
+            fitted = slope * x_values[: endpoint + 1] + intercept
+            residuals = y_values[: endpoint + 1] - fitted
+        return LinearRangeResult(
+            endpoint_index=endpoint,
+            endpoint_x=float(x_values[endpoint]),
+            slope=slope,
+            intercept=intercept,
+            r2=r2,
+            residuals=residuals,
+        )
+
+    final_index = x_values.size - 1
+    full_fit = fit(final_index)
+    if full_fit[2] >= r2_threshold:
+        return finish(final_index, full_fit)
+
+    first_candidate = min_points - 1
+    first_fit = fit(first_candidate)
+    if first_fit[2] < r2_threshold:
+        return LinearRangeResult(None, None, None, None, None)
+
+    lo = first_candidate
+    hi = final_index
+    lo_fit = first_fit
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        mid_fit = fit(mid)
+        if mid_fit[2] >= r2_threshold:
+            lo = mid
+            lo_fit = mid_fit
+        else:
+            hi = mid
+    return finish(lo, lo_fit)
+
 def _unique_strings(values: list[str]) -> list[str]:
     return list(dict.fromkeys(values))
 
@@ -1686,6 +1976,11 @@ PROCESSED_DEFAULT_PLOTS = [
     {"x": "time_from_onset_s", "y": "force_g"},
     {"x": "radial_Hencky_strain", "y": "net_stress_Pa"},
 ]
+DATA_PLOT_HEIGHT = 520
+POSTPROCESSING_SMALL_PLOT_HEIGHT = 225
+POSTPROCESSING_TALL_PLOT_HEIGHT = 487
+DEFAULT_STRAIN_FORMULA = "MA(HS,121)"
+DEFAULT_POSTPROCESSING_FORCE_FORMULA = "MA(LP(F,20),1000)"
 
 IFF_PALETTE = (
     "#0075CF",
@@ -1733,11 +2028,29 @@ class SummaryRequest:
 
 
 @dataclass(frozen=True)
+class PostprocessingRequest:
+    selected_files: tuple[str, ...]
+    y_column: str
+    force_settings: FilterSettings
+    strain_settings: FilterSettings
+    y_settings: FilterSettings
+    r2_threshold: float
+    min_points: int
+    epsilon_start: float
+    show_legend: bool
+    y_scale: str
+    show_window: bool
+    show_slope: bool
+    selected_materials: tuple[str, ...]
+    selected_velocities: tuple[str, ...]
+    physical_settings: PhysicalSettings
+
+@dataclass(frozen=True)
 class FrequencyRequest:
     selected_files: tuple[str, ...]
     signal_column: str
     filter_settings: FilterSettings
-    peak_settings: tuple[float, float, int, int, int]
+    peak_settings: tuple[float, float, int, int, float]
     individual_plot: str
     summary_plot: str
     show_peaks: bool
@@ -1749,6 +2062,31 @@ class FrequencyRequest:
     selected_materials: tuple[str, ...]
     selected_velocities: tuple[str, ...]
     physical_settings: PhysicalSettings
+
+
+def plot_analysis_key(request: PlotRequest) -> tuple[Any, ...]:
+    return (
+        request.x_column,
+        request.y_column,
+        request.selected_files,
+        repr(request.force_variants),
+        repr(request.strain_variants),
+        request.selected_materials,
+        request.selected_velocities,
+        repr(request.physical_settings),
+    )
+
+
+def frequency_analysis_key(request: FrequencyRequest) -> tuple[Any, ...]:
+    return (
+        request.selected_files,
+        request.signal_column,
+        repr(request.filter_settings),
+        request.peak_settings,
+        request.selected_materials,
+        request.selected_velocities,
+        repr(request.physical_settings),
+    )
 
 
 def column_axis_title(column: str) -> str:
@@ -1808,18 +2146,41 @@ def main() -> None:
         st.code(str(DATA_DIR), language="text")
         return
 
-    if workspace == WORKSPACE_DATA:
-        render_dashboard(
-            file_summary, signature, physical_settings,
-            "processed", PROCESSED_AXIS_COLUMNS, PROCESSED_DEFAULT_PLOTS,
-            allow_processing=True,
-        )
-    elif workspace == WORKSPACE_FREQUENCY:
-        render_frequency_workspace(file_summary, signature, physical_settings)
-    elif workspace == WORKSPACE_POSTPROCESSING:
-        render_postprocessing_workspace()
-    else:
-        render_summary_workspace(file_summary, signature, physical_settings)
+    workspace_scope = next(
+        scope for name, _, scope in WORKSPACE_DEFINITIONS if name == workspace
+    )
+    inactive_scopes = [
+        scope
+        for _, _, scope in WORKSPACE_DEFINITIONS
+        if scope != workspace_scope
+    ]
+    hidden_workspace_css = "\n".join(
+        f".st-key-workspace_slot_{scope} {{ display: none !important; }}"
+        for scope in inactive_scopes
+    )
+    st.markdown(
+        f"<style>{hidden_workspace_css}</style>",
+        unsafe_allow_html=True,
+    )
+    workspace_slots = {
+        scope: st.container(key=f"workspace_slot_{scope}")
+        for _, _, scope in WORKSPACE_DEFINITIONS
+    }
+    with workspace_slots[workspace_scope]:
+        if workspace == WORKSPACE_DATA:
+            render_dashboard(
+                file_summary, signature, physical_settings,
+                "processed", PROCESSED_AXIS_COLUMNS, PROCESSED_DEFAULT_PLOTS,
+                allow_processing=True,
+            )
+        elif workspace == WORKSPACE_FREQUENCY:
+            render_frequency_workspace(file_summary, signature, physical_settings)
+        elif workspace == WORKSPACE_POSTPROCESSING:
+            render_postprocessing_workspace(
+                file_summary, signature, physical_settings
+            )
+        else:
+            render_summary_workspace(file_summary, signature, physical_settings)
 
 
 def inject_styles() -> None:
@@ -1853,6 +2214,14 @@ def inject_styles() -> None:
         }
         input[type="checkbox"] {
             accent-color: var(--vader-accent);
+        }
+        [data-baseweb="tag"] {
+            color: #ffffff !important;
+            background-color: var(--vader-accent) !important;
+        }
+        [data-baseweb="tag"] svg {
+            color: #ffffff !important;
+            fill: #ffffff !important;
         }
         label[data-baseweb="checkbox"] input[type="checkbox"]:checked + div,
         label[data-baseweb="checkbox"] input[role="switch"]:checked + div {
@@ -1890,7 +2259,14 @@ def inject_styles() -> None:
         div[data-testid="stSegmentedControl"] button[aria-pressed="true"] p {
             color: #ffffff !important;
         }
-        div[class*="_compact_view"] button p {
+        div[data-testid="stButtonGroup"] [role="radio"][aria-checked="true"] {
+            color: #ffffff !important;
+            background-color: var(--vader-accent) !important;
+            border-color: var(--vader-accent) !important;
+        }
+        div[data-testid="stButtonGroup"] [role="radio"][aria-checked="true"] p {
+            color: #ffffff !important;
+        }        div[class*="_compact_view"] button p {
             position: absolute;
             width: 1px;
             height: 1px;
@@ -2118,17 +2494,21 @@ def inject_styles() -> None:
             font-weight: 600;
             white-space: nowrap;
         }
-        .frequency-row-label {
-            display: flex;
-            align-items: center;
-            min-height: 2.5rem;
-            color: var(--vader-muted);
-            font-size: 0.7rem;
-            font-weight: 700;
-            letter-spacing: 0;
-            text-transform: uppercase;
-            white-space: nowrap;
+        .st-key-postprocessing_controls_v5 div[data-testid="stVerticalBlockBorderWrapper"] {
+            padding: 0.32rem 0.42rem 0.05rem;
         }
+        .st-key-postprocessing_controls_v5 {
+            width: 100%;
+            max-width: 90rem;
+        }
+        .st-key-postprocessing_controls_v5 button p,
+        .st-key-postprocessing_controls_v5 div[data-testid="stSelectbox"] p {
+            font-size: 0.70rem;
+        }
+        .st-key-postprocessing_controls_v5 .inline-control-label {
+            font-size: 0.68rem;
+        }
+
         @media (max-width: 900px) {
             .block-container {
                 padding-right: 0.45rem;
@@ -2485,6 +2865,24 @@ def restore_selection_controls(
     material_set = set(selected_materials)
     velocity_set = set(selected_velocities)
     file_set = set(selected_files)
+    all_materials = sorted(
+        file_summary["material"].dropna().astype(str).unique()
+    )
+    all_velocities = sorted_velocity_values(file_summary["velocity"])
+    st.session_state[f"{selector_scope}_data_materials"] = [
+        value for value in all_materials if value in material_set
+    ]
+    st.session_state[f"{selector_scope}_data_velocities"] = [
+        value for value in all_velocities if value in velocity_set
+    ]
+    for material in all_materials:
+        st.session_state[f"{selector_scope}_data_material_{material}"] = (
+            material in material_set
+        )
+    for velocity in all_velocities:
+        st.session_state[f"{selector_scope}_data_velocity_{velocity}"] = (
+            velocity in velocity_set
+        )
     for material in file_summary["material"].dropna().astype(str).unique():
         st.session_state[f"{selector_scope}_material_{material}"] = (
             material in material_set
@@ -2544,7 +2942,7 @@ def render_plot_view_controls(
     y_scale_key = f"{key_prefix}_y_scale"
     scale_for_y_key = f"{key_prefix}_scale_for_y"
 
-    st.session_state.setdefault(show_legend_key, True)
+    st.session_state.setdefault(show_legend_key, False)
     st.session_state.setdefault(raw_overlay_key, True)
     st.session_state.setdefault(x_scale_key, "Linear")
     if st.session_state.get(scale_for_y_key) != y_column:
@@ -2631,8 +3029,6 @@ def render_plot_window(
             f'<div class="plot-heading">Plot {index + 1}</div>',
             unsafe_allow_html=True,
         )
-        materials = sorted(file_summary["material"].dropna().astype(str).unique())
-        velocities = sorted_velocity_values(file_summary["velocity"])
         force_variants = parse_filter_formula_list("force_g", "force_g")
         strain_variants = parse_filter_formula_list("HS", "radial_Hencky_strain")
         show_raw_overlay = False
@@ -2640,10 +3036,14 @@ def render_plot_window(
         st.session_state.setdefault(f"{key_prefix}_y", defaults["y"])
 
         selector_scope = f"{scope}_{index}"
+        materials = sorted(
+            file_summary["material"].dropna().astype(str).unique()
+        )
+        velocities = sorted_velocity_values(file_summary["velocity"])
         group_widths = (
-            [1, 1.1, 1.1, 1.15]
+            [1.08, 0.95, 1.08, 1.02]
             if allow_processing
-            else [1, 1.1, 1.15]
+            else [1.08, 0.95, 1.02]
         )
         control_groups = st.columns(
             group_widths,
@@ -2666,26 +3066,29 @@ def render_plot_window(
             selected_velocities = render_filter_dropdown(
                 selector_scope, "Velocity", velocities
             )
+        eligible = file_summary[
+            file_summary["material"].astype(str).isin(selected_materials)
+            & file_summary["velocity"].astype(str).isin(selected_velocities)
+        ]
 
         if allow_processing:
             with control_groups[2]:
                 strain_variants = render_formula_variant_controls(
-                    f"{key_prefix}_strain", "HS", "radial_Hencky_strain"
+                    f"{key_prefix}_strain",
+                    "εᵣ",
+                    "radial_Hencky_strain",
+                    default_formula=DEFAULT_STRAIN_FORMULA,
                 )
                 force_variants = render_formula_variant_controls(
-                    f"{key_prefix}_force", "Force", "force_g"
+                    f"{key_prefix}_force", "F", "force_g"
                 )
             action_group = control_groups[3]
         else:
             action_group = control_groups[2]
 
-        eligible_summary = file_summary[
-            file_summary["material"].astype(str).isin(selected_materials)
-            & file_summary["velocity"].astype(str).isin(selected_velocities)
-        ]
         with action_group:
-            selected_files, runs_done = render_file_selector(
-                selector_scope, eligible_summary
+            selected_files, runs_done = render_data_selector(
+                selector_scope, eligible
             )
             action_columns = st.columns(
                 [1.7, 0.55],
@@ -2748,8 +3151,17 @@ def render_plot_window(
                 key=f"{key_prefix}_empty",
             )
             return
-        if repr(draft_request) != repr(applied_request):
+        if plot_analysis_key(draft_request) != plot_analysis_key(applied_request):
             st.caption("Controls changed. Press Update to apply them.")
+
+        applied_request = replace(
+            applied_request,
+            show_raw_overlay=bool(show_raw_overlay),
+            show_legend=bool(show_legend),
+            x_scale=x_scale,
+            y_scale=y_scale,
+        )
+        st.session_state[applied_key] = applied_request
         if not applied_request.selected_files:
             render_empty_plot_figure(
                 normalize_axis_column(applied_request.x_column),
@@ -2839,7 +3251,7 @@ def render_plot_window(
         job_key = make_job_key(
             scope, index, signature, applied_physics,
             force_variants, strain_variants, x_column, y_column,
-            tuple(selected_files), show_raw_overlay,
+            tuple(selected_files),
         )
         render_background_processed_plot(
             job_key,
@@ -2929,13 +3341,19 @@ def render_formula_variant_controls(
     scope: str,
     label: str,
     source_column: str,
+    default_formula: str | None = None,
 ) -> tuple[FormulaVariant, ...]:
-    key = f"{scope}_formula_list"
-    if key not in st.session_state:
-        st.session_state[key] = formula_source_label(source_column)
+    formula_key = f"{scope}_formula_list"
+    editor_key = f"{scope}_edit_variant"
+    if formula_key not in st.session_state:
+        st.session_state[formula_key] = (
+            default_formula or formula_source_label(source_column)
+        )
 
     try:
-        variants = parse_filter_formula_list(str(st.session_state[key]), source_column)
+        variants = parse_filter_formula_list(
+            str(st.session_state[formula_key]), source_column
+        )
         valid = True
     except ValueError:
         variants = parse_filter_formula_list(source_column, source_column)
@@ -2943,38 +3361,204 @@ def render_formula_variant_controls(
 
     if not valid:
         button_label = f"{label}: Invalid"
-    elif len(variants) == 1 and not variants[0].settings.active:
-        button_label = f"{label}: Raw"
+    elif len(variants) == 1:
+        button_label = f"{label}: {variants[0].label}"
     else:
-        suffix = "variant" if len(variants) == 1 else "variants"
-        button_label = f"{label}: {len(variants)} {suffix}"
+        button_label = f"{label}: {len(variants)} variants"
 
     with st.popover(button_label, width="stretch"):
         formula_text = st.text_area(
-            "Formulas",
-            key=key,
-            height=92,
+            "Formula variants",
+            key=formula_key,
+            height=86,
             help=(
-                "One formula per line. You can also separate formulas with semicolons "
-                "or top-level commas. Shorthand like LP(20) means LP(signal,20)."
+                "One formula per line. Semicolons and top-level commas are also "
+                "accepted. Shorthand like LP(20) means LP(signal,20)."
             ),
         )
         try:
             variants = parse_filter_formula_list(formula_text, source_column)
         except ValueError as exc:
             st.error(str(exc))
-            return parse_filter_formula_list(formula_source_label(source_column), source_column)
-        st.caption("Parsed: " + "; ".join(variant.label for variant in variants))
+            return parse_filter_formula_list(
+                formula_source_label(source_column), source_column
+            )
+
+        variant_indices = list(range(len(variants)))
+        if st.session_state.get(editor_key) not in variant_indices:
+            st.session_state[editor_key] = 0
+        selected_index = st.selectbox(
+            "Edit formula",
+            variant_indices,
+            key=editor_key,
+            format_func=lambda index: variants[index].label,
+        )
+        filter_name = st.segmented_control(
+            "Filter",
+            [specification.ui_label for specification in FILTER_CONTROL_SPECS],
+            default=FILTER_CONTROL_SPECS[0].ui_label,
+            required=True,
+            key=f"{scope}_new_filter",
+            width="stretch",
+        )
+        new_step = render_filter_step_options(
+            f"{scope}_builder", str(filter_name)
+        )
+        actions = st.columns(
+            [1.15, 1.35, 0.62, 0.62, 0.62], gap="small"
+        )
+        actions[0].button(
+            "Apply",
+            key=f"{scope}_apply_filter",
+            width="stretch",
+            disabled=new_step is None,
+            on_click=update_formula_variant_list,
+            args=(
+                formula_key,
+                editor_key,
+                source_column,
+                "apply",
+                int(selected_index),
+                new_step,
+            ),
+        )
+        actions[1].button(
+            "Compare",
+            key=f"{scope}_compare_filter",
+            width="stretch",
+            disabled=new_step is None,
+            on_click=update_formula_variant_list,
+            args=(
+                formula_key,
+                editor_key,
+                source_column,
+                "compare",
+                int(selected_index),
+                new_step,
+            ),
+        )
+        actions[2].button(
+            "",
+            icon=":material/undo:",
+            help="Remove the outermost filter from this formula",
+            key=f"{scope}_undo_filter",
+            width="stretch",
+            disabled=not variants[int(selected_index)].settings.active,
+            on_click=update_formula_variant_list,
+            args=(
+                formula_key,
+                editor_key,
+                source_column,
+                "undo",
+                int(selected_index),
+                None,
+            ),
+        )
+        actions[3].button(
+            "",
+            icon=":material/restart_alt:",
+            help="Reset this formula to the raw signal",
+            key=f"{scope}_reset_formula",
+            width="stretch",
+            disabled=not variants[int(selected_index)].settings.active,
+            on_click=update_formula_variant_list,
+            args=(
+                formula_key,
+                editor_key,
+                source_column,
+                "reset",
+                int(selected_index),
+                None,
+            ),
+        )
+        actions[4].button(
+            "",
+            icon=":material/delete:",
+            help="Delete this formula variant",
+            key=f"{scope}_delete_formula",
+            width="stretch",
+            disabled=len(variants) <= 1,
+            on_click=update_formula_variant_list,
+            args=(
+                formula_key,
+                editor_key,
+                source_column,
+                "delete",
+                int(selected_index),
+                None,
+            ),
+        )
     return variants
+
+
+def update_formula_variant_list(
+    formula_key: str,
+    editor_key: str,
+    source_column: str,
+    action: str,
+    selected_index: int,
+    step: FilterStep | None,
+) -> None:
+    try:
+        variants = list(parse_filter_formula_list(
+            str(st.session_state.get(formula_key, source_column)),
+            source_column,
+        ))
+    except ValueError:
+        variants = list(parse_filter_formula_list(source_column, source_column))
+    selected_index = min(max(selected_index, 0), len(variants) - 1)
+    expressions = [variant.expression for variant in variants]
+    parsed_source, steps = parse_filter_formula(expressions[selected_index])
+    target_expression = expressions[selected_index]
+
+    if action in {"apply", "compare"} and step is not None:
+        target_expression = format_filter_formula(
+            formula_source_label(parsed_source), (*steps, step)
+        )
+        if action == "apply":
+            expressions[selected_index] = target_expression
+        else:
+            expressions.insert(selected_index + 1, target_expression)
+    elif action == "undo" and steps:
+        target_expression = format_filter_formula(
+            formula_source_label(parsed_source), steps[:-1]
+        )
+        expressions[selected_index] = target_expression
+    elif action == "reset":
+        target_expression = formula_source_label(parsed_source)
+        expressions[selected_index] = target_expression
+    elif action == "delete" and len(expressions) > 1:
+        expressions.pop(selected_index)
+        target_expression = expressions[min(selected_index, len(expressions) - 1)]
+
+    normalized = parse_filter_formula_list(
+        "\n".join(expressions), source_column
+    )
+    st.session_state[formula_key] = "\n".join(
+        variant.expression for variant in normalized
+    )
+    st.session_state[editor_key] = next(
+        (
+            index
+            for index, variant in enumerate(normalized)
+            if variant.expression == target_expression
+        ),
+        0,
+    )
+
 def render_processing_controls(
     scope: str,
     source_column: str,
     axis_label: str = "Formula",
+    default_formula: str | None = None,
+    show_axis_label: bool = True,
 ) -> FilterSettings:
     formula_key = f"{scope}_filter_formula"
     source_key = f"{scope}_filter_source"
     if formula_key not in st.session_state:
-        st.session_state[formula_key] = formula_source_label(source_column)
+        st.session_state[formula_key] = (
+            default_formula or formula_source_label(source_column)
+        )
     if st.session_state.get(source_key) != source_column:
         try:
             _, existing_steps = parse_filter_formula(st.session_state[formula_key])
@@ -2997,12 +3581,15 @@ def render_processing_controls(
     workflow = ()
 
     if not formula_valid:
-        button_label = f"{axis_label}: Invalid"
+        status_label = "Invalid"
     elif current_steps:
         suffix = "filter" if len(current_steps) == 1 else "filters"
-        button_label = f"{axis_label}: {len(current_steps)} {suffix}"
+        status_label = f"{len(current_steps)} {suffix}"
     else:
-        button_label = f"{axis_label}: Raw"
+        status_label = "Raw"
+    button_label = (
+        f"{axis_label}: {status_label}" if show_axis_label else status_label
+    )
 
     with st.popover(button_label, width="stretch"):
         formula = st.text_input(
@@ -3150,38 +3737,39 @@ def numerically_sorted_file_summary(file_summary: pd.DataFrame) -> pd.DataFrame:
     ).drop(columns=["_velocity_sort", "_velocity_text"])
 
 
-def render_file_selector(
+def render_data_selector(
     index: int | str,
     file_summary: pd.DataFrame,
+    default_selected: bool = False,
 ) -> tuple[list[str], bool]:
     ordered_summary = numerically_sorted_file_summary(file_summary)
-    files = ordered_summary["source_file"].tolist()
+    files = ordered_summary["source_file"].astype(str).tolist()
     for file_name in files:
         key = f"plot_{index}_file_{file_name}"
         if key not in st.session_state:
-            st.session_state[key] = False
+            st.session_state[key] = default_selected
 
     selected_count = sum(
         bool(st.session_state[f"plot_{index}_file_{file_name}"])
         for file_name in files
     )
-    popover_key = f"plot_{index}_series_popover"
+    popover_key = f"plot_{index}_data_popover"
     done_requested = False
     with st.popover(
-        f"Runs {selected_count}/{len(files)}",
+        f"Data {selected_count}/{len(files)}",
         icon=":material/dataset:",
         help="Choose data series",
         width="stretch",
         key=popover_key,
         on_change="rerun",
     ):
-        with st.form(f"plot_{index}_series_form", border=False):
+        with st.form(f"plot_{index}_data_form", border=False):
             if files:
                 checkbox_columns = st.columns(2, gap="small")
                 for file_index, row in ordered_summary.reset_index(
                     drop=True
                 ).iterrows():
-                    file_name = row["source_file"]
+                    file_name = str(row["source_file"])
                     label = get_file_label(row)
                     with checkbox_columns[file_index % len(checkbox_columns)]:
                         st.checkbox(
@@ -3190,7 +3778,7 @@ def render_file_selector(
                             help=file_name,
                         )
             else:
-                st.caption("No runs match the material and velocity filters.")
+                st.caption("No data matches the current filters.")
 
             action_columns = st.columns(3, gap="small")
             action_columns[0].form_submit_button(
@@ -3210,9 +3798,8 @@ def render_file_selector(
             done_requested = action_columns[2].form_submit_button(
                 "Done",
                 type="primary",
-                on_click=close_runs_selector,
+                on_click=close_data_selector,
                 args=(popover_key,),
-                disabled=not files,
                 width="stretch",
             )
 
@@ -3223,8 +3810,7 @@ def render_file_selector(
     ]
     return selected_files, bool(done_requested)
 
-
-def close_runs_selector(popover_key: str) -> None:
+def close_data_selector(popover_key: str) -> None:
     st.session_state[popover_key] = False
 
 
@@ -3330,6 +3916,8 @@ def render_background_processed_plot(
 
     @st.fragment(run_every=0.75)
     def pending_processed_plot() -> None:
+        if normalize_workspace(st.session_state.get("workspace")) != WORKSPACE_DATA:
+            st.rerun()
         if future.done():
             st.rerun()
         st.caption("Processing selected data in background...")
@@ -3502,7 +4090,7 @@ def make_processed_figure(
             )
 
     figure.update_layout(
-        height=650,
+        height=DATA_PLOT_HEIGHT,
         margin={"l": 8, "r": 8, "t": 15, "b": 8},
         paper_bgcolor="#ffffff",
         plot_bgcolor="#ffffff",
@@ -3531,7 +4119,7 @@ def make_empty_plot_figure(
 ) -> go.Figure:
     figure = go.Figure()
     figure.update_layout(
-        height=650,
+        height=DATA_PLOT_HEIGHT,
         margin={"l": 8, "r": 8, "t": 15, "b": 8},
         paper_bgcolor="#ffffff",
         plot_bgcolor="#ffffff",
@@ -3694,7 +4282,7 @@ def make_figure(
         },
     )
     figure.update_layout(
-        height=650,
+        height=DATA_PLOT_HEIGHT,
         margin={"l": 8, "r": 8, "t": 15, "b": 8},
         paper_bgcolor="#ffffff",
         plot_bgcolor="#ffffff",
@@ -3798,9 +4386,971 @@ def make_job_key(*parts: Any) -> str:
     return hashlib.sha256(repr(parts).encode("utf-8")).hexdigest()
 
 
-def render_postprocessing_workspace() -> None:
-    st.info("Postprocessing workspace ready for feature extraction.")
+def restore_postprocessing_controls(file_summary: pd.DataFrame) -> None:
+    request = st.session_state.get("postprocessing_applied_request")
+    required_fields = (
+        "r2_threshold",
+        "epsilon_start",
+        "y_settings",
+        "y_scale",
+        "show_window",
+        "show_slope",
+    )
+    if request is None or not all(
+        hasattr(request, field_name) for field_name in required_fields
+    ):
+        return
+    st.session_state["postprocessing_y"] = normalize_axis_column(
+        request.y_column
+    )
+    st.session_state["postprocessing_y_formula_filter_formula"] = (
+        format_filter_formula(
+            formula_source_label(request.y_column),
+            request.y_settings.workflow,
+        )
+    )
+    st.session_state["postprocessing_y_formula_filter_source"] = (
+        request.y_column
+    )
+    st.session_state["postprocessing_strain_filter_formula"] = (
+        format_filter_formula(
+            formula_source_label("radial_Hencky_strain"),
+            request.strain_settings.workflow,
+        )
+    )
+    st.session_state["postprocessing_strain_filter_source"] = (
+        "radial_Hencky_strain"
+    )
+    st.session_state["postprocessing_force_filter_formula"] = (
+        format_filter_formula(
+            formula_source_label("force_g"),
+            request.force_settings.workflow,
+        )
+    )
+    st.session_state["postprocessing_force_filter_source"] = "force_g"
+    st.session_state["postprocessing_r2_threshold"] = request.r2_threshold
+    st.session_state["postprocessing_min_points"] = request.min_points
+    st.session_state["postprocessing_epsilon_start"] = request.epsilon_start
+    st.session_state["postprocessing_show_legend"] = request.show_legend
+    st.session_state["postprocessing_y_scale_control"] = request.y_scale.title()
+    st.session_state["postprocessing_scale_for_y"] = request.y_column
+    st.session_state["postprocessing_show_window"] = request.show_window
+    st.session_state["postprocessing_show_slope"] = request.show_slope
+    restore_selection_controls(
+        "postprocessing",
+        file_summary,
+        request.selected_files,
+        request.selected_materials,
+        request.selected_velocities,
+    )
 
+
+def render_postprocessing_window_controls() -> tuple[float, int, float]:
+    st.session_state.setdefault("postprocessing_epsilon_start", 1.0)
+    st.session_state.setdefault("postprocessing_r2_threshold", 0.995)
+    st.session_state.setdefault("postprocessing_min_points", 3)
+    with st.popover(
+        "Window",
+        icon=":material/fit_screen:",
+        width="stretch",
+    ):
+        epsilon_start = st.number_input(
+            "Start εᵣ,₀",
+            step=0.1,
+            format="%.4g",
+            key="postprocessing_epsilon_start",
+            help="The first sample at or above this strain starts the window.",
+        )
+        r2_threshold = st.number_input(
+            "Minimum R²",
+            min_value=0.0,
+            max_value=1.0,
+            step=0.001,
+            format="%.4f",
+            key="postprocessing_r2_threshold",
+        )
+        min_points = st.number_input(
+            "Minimum points",
+            min_value=2,
+            max_value=100_000,
+            step=1,
+            key="postprocessing_min_points",
+        )
+    return float(r2_threshold), int(min_points), float(epsilon_start)
+
+
+def render_postprocessing_view_controls(
+    y_column: str,
+) -> tuple[bool, str, bool, bool]:
+    scale_key = "postprocessing_y_scale_control"
+    scale_for_key = "postprocessing_scale_for_y"
+    st.session_state.setdefault("postprocessing_show_legend", False)
+    st.session_state.setdefault("postprocessing_show_window", True)
+    st.session_state.setdefault("postprocessing_show_slope", True)
+    if st.session_state.get(scale_for_key) != y_column:
+        st.session_state.pop(scale_key, None)
+        st.session_state[scale_for_key] = y_column
+    default_scale = "Log" if uses_log_y(y_column) else "Linear"
+    scale_arguments = (
+        {"default": default_scale}
+        if scale_key not in st.session_state
+        else {}
+    )
+    with st.container(key="postprocessing_compact_view"):
+        with st.popover(
+            "View",
+            icon=":material/visibility:",
+            help="View options",
+            width="stretch",
+        ):
+            show_legend = st.toggle(
+                "Legend", key="postprocessing_show_legend"
+            )
+            show_window = st.toggle(
+                "Window", key="postprocessing_show_window"
+            )
+            show_slope = st.toggle(
+                "Slope", key="postprocessing_show_slope"
+            )
+            y_scale = st.segmented_control(
+                "Y axis",
+                ["Linear", "Log"],
+                key=scale_key,
+                width="stretch",
+                **scale_arguments,
+            )
+    return (
+        bool(show_legend),
+        normalize_axis_scale(str(y_scale or default_scale)),
+        bool(show_window),
+        bool(show_slope),
+    )
+
+
+def render_postprocessing_plot_shell() -> tuple[Any, Any, Any]:
+    left_column, right_column = st.columns(
+        [1, 1], gap="small", vertical_alignment="top"
+    )
+    with left_column:
+        st.markdown(
+            '<div class="plot-heading">Selected variable vs time</div>',
+            unsafe_allow_html=True,
+        )
+        top_target = st.empty()
+        st.markdown(
+            '<div class="plot-heading">Hencky strain working window</div>',
+            unsafe_allow_html=True,
+        )
+        strain_target = st.empty()
+    with right_column:
+        st.markdown(
+            '<div class="plot-heading">Selected variable vs strain</div>',
+            unsafe_allow_html=True,
+        )
+        right_target = st.empty()
+    return top_target, strain_target, right_target
+
+def valid_postprocessing_request(request: object) -> bool:
+    required_fields = (
+        "r2_threshold",
+        "epsilon_start",
+        "y_settings",
+        "y_scale",
+        "show_window",
+        "show_slope",
+    )
+    return request is not None and all(
+        hasattr(request, field_name) for field_name in required_fields
+    )
+
+
+def render_postprocessing_workspace(
+    file_summary: pd.DataFrame,
+    signature: tuple[tuple[str, int, int], ...],
+    physical_settings: PhysicalSettings,
+) -> None:
+    applied_key = "postprocessing_applied_request"
+    defaults_version_key = "_postprocessing_defaults_v4"
+    if not st.session_state.get(defaults_version_key, False):
+        st.session_state["postprocessing_y"] = "extensional_viscosity_Pa_s"
+        st.session_state["postprocessing_y_formula_filter_formula"] = (
+            formula_source_label("extensional_viscosity_Pa_s")
+        )
+        st.session_state["postprocessing_y_formula_filter_source"] = (
+            "extensional_viscosity_Pa_s"
+        )
+        st.session_state["postprocessing_strain_filter_formula"] = (
+            DEFAULT_STRAIN_FORMULA
+        )
+        st.session_state["postprocessing_strain_filter_source"] = (
+            "radial_Hencky_strain"
+        )
+        st.session_state["postprocessing_force_filter_formula"] = (
+            DEFAULT_POSTPROCESSING_FORCE_FORMULA
+        )
+        st.session_state["postprocessing_force_filter_source"] = "force_g"
+        st.session_state["postprocessing_epsilon_start"] = 1.0
+        st.session_state["postprocessing_r2_threshold"] = 0.995
+        st.session_state["postprocessing_min_points"] = 3
+        st.session_state["postprocessing_show_legend"] = False
+        st.session_state["postprocessing_y_scale"] = "Log"
+        st.session_state["postprocessing_scale_for_y"] = (
+            "extensional_viscosity_Pa_s"
+        )
+        st.session_state["postprocessing_show_window"] = True
+        st.session_state["postprocessing_show_slope"] = True
+        st.session_state.pop(applied_key, None)
+        st.session_state[defaults_version_key] = True
+    if st.session_state.get("_restore_scope") == "postprocessing":
+        restore_postprocessing_controls(file_summary)
+        st.session_state.pop("_restore_scope", None)
+
+    st.session_state.setdefault(
+        "postprocessing_y", "extensional_viscosity_Pa_s"
+    )
+
+    materials = sorted(
+        file_summary["material"].dropna().astype(str).unique()
+    )
+    velocities = sorted_velocity_values(file_summary["velocity"])
+
+    with st.container(border=True, key="postprocessing_controls_v5"):
+        control_columns = st.columns(
+            [1.20, 1.15, 1.25, 1.25, 1.50, 1.20, 1.30, 1.15, 0.42, 0.42],
+            gap="small",
+            vertical_alignment="center",
+        )
+        with control_columns[0]:
+            selected_materials = render_filter_dropdown(
+                "postprocessing", "Material", materials
+            )
+        with control_columns[1]:
+            selected_velocities = render_filter_dropdown(
+                "postprocessing", "Velocity", velocities
+            )
+        eligible = file_summary[
+            file_summary["material"].astype(str).isin(selected_materials)
+            & file_summary["velocity"].astype(str).isin(selected_velocities)
+        ]
+        with control_columns[2]:
+            selected_files, runs_done = render_data_selector(
+                "postprocessing", eligible
+            )
+        with control_columns[3]:
+            y_label, y_control = st.columns(
+                [0.18, 0.82], gap=None, vertical_alignment="center"
+            )
+            with y_label:
+                render_inline_label("Y:")
+            with y_control:
+                y_column = st.selectbox(
+                    "Y variable",
+                    PROCESSED_AXIS_COLUMNS,
+                    index=None,
+                    key="postprocessing_y",
+                    label_visibility="collapsed",
+                    format_func=column_menu_label,
+                )
+        with control_columns[4]:
+            formula_label, formula_control = st.columns(
+                [0.34, 0.66], gap=None, vertical_alignment="center"
+            )
+            with formula_label:
+                render_inline_label("Formula:")
+            with formula_control:
+                y_settings = render_processing_controls(
+                    "postprocessing_y_formula",
+                    str(y_column),
+                    show_axis_label=False,
+                )
+        with control_columns[5]:
+            strain_settings = render_processing_controls(
+                "postprocessing_strain",
+                "radial_Hencky_strain",
+                axis_label="εᵣ",
+                default_formula=DEFAULT_STRAIN_FORMULA,
+            )
+        with control_columns[6]:
+            force_settings = render_processing_controls(
+                "postprocessing_force",
+                "force_g",
+                axis_label="F",
+                default_formula=DEFAULT_POSTPROCESSING_FORCE_FORMULA,
+            )
+        with control_columns[7]:
+            r2_threshold, min_points, epsilon_start = (
+                render_postprocessing_window_controls()
+            )
+        with control_columns[8]:
+            (
+                show_legend,
+                y_scale,
+                show_window,
+                show_slope,
+            ) = render_postprocessing_view_controls(str(y_column))
+        with control_columns[9]:
+            update_requested = st.button(
+                "",
+                key="postprocessing_update",
+                type="primary",
+                icon=":material/refresh:",
+                help="Update postprocessing plots",
+                width="stretch",
+            )
+
+    plot_targets = render_postprocessing_plot_shell()
+    draft_request = PostprocessingRequest(
+        selected_files=tuple(selected_files),
+        y_column=str(y_column),
+        force_settings=force_settings,
+        strain_settings=strain_settings,
+        y_settings=y_settings,
+        r2_threshold=r2_threshold,
+        min_points=min_points,
+        epsilon_start=epsilon_start,
+        show_legend=show_legend,
+        y_scale=y_scale,
+        show_window=show_window,
+        show_slope=show_slope,
+        selected_materials=tuple(selected_materials),
+        selected_velocities=tuple(selected_velocities),
+        physical_settings=physical_settings,
+    )
+    if update_requested or runs_done:
+        st.session_state[applied_key] = draft_request
+
+    applied_request = st.session_state.get(applied_key)
+    if not valid_postprocessing_request(applied_request):
+        applied_request = None
+    if applied_request is None:
+        render_postprocessing_plot_layout(
+            None,
+            str(y_column),
+            {},
+            show_legend=False,
+            y_scale=y_scale,
+            show_window=show_window,
+            show_slope=show_slope,
+            targets=plot_targets,
+        )
+        return
+
+    immediate_view = replace(
+        applied_request,
+        show_legend=show_legend,
+        y_scale=(
+            y_scale
+            if applied_request.y_column == str(y_column)
+            else applied_request.y_scale
+        ),
+        show_window=show_window,
+        show_slope=show_slope,
+    )
+    st.session_state[applied_key] = immediate_view
+    applied_request = immediate_view
+    if repr(draft_request) != repr(applied_request):
+        st.caption("Controls changed. Press Update to apply them.")
+    if not applied_request.selected_files:
+        render_postprocessing_plot_layout(
+            None,
+            normalize_axis_column(applied_request.y_column),
+            {},
+            show_legend=False,
+            y_scale=applied_request.y_scale,
+            show_window=applied_request.show_window,
+            show_slope=applied_request.show_slope,
+            targets=plot_targets,
+        )
+        return
+
+    raw_data, issues = load_selected_dataset(
+        str(DATA_DIR), signature, applied_request.selected_files
+    )
+    for issue in issues:
+        st.warning(issue)
+    if raw_data.empty:
+        st.warning("No compatible rows were loaded for the selected data.")
+        render_postprocessing_plot_layout(
+            None,
+            normalize_axis_column(applied_request.y_column),
+            {},
+            show_legend=False,
+            y_scale=applied_request.y_scale,
+            show_window=applied_request.show_window,
+            show_slope=applied_request.show_slope,
+            targets=plot_targets,
+        )
+        return
+
+    preprocessed = preprocess_dataset(
+        raw_data, applied_request.physical_settings
+    )
+    if preprocessed.warnings:
+        with st.expander(
+            f"Preprocessing warnings ({len(preprocessed.warnings)})"
+        ):
+            for warning in preprocessed.warnings:
+                st.caption(warning)
+
+    labels = {
+        row["source_file"]: get_file_label(row)
+        for _, row in file_summary.iterrows()
+        if row["source_file"] in applied_request.selected_files
+    }
+    job_key = make_job_key(
+        "postprocessing",
+        signature,
+        applied_request.selected_files,
+        applied_request.y_column,
+        applied_request.force_settings,
+        applied_request.strain_settings,
+        applied_request.y_settings,
+        applied_request.r2_threshold,
+        applied_request.min_points,
+        applied_request.epsilon_start,
+        applied_request.physical_settings,
+    )
+    future = submit_background_job(
+        job_key,
+        analyze_postprocessing_runs,
+        preprocessed.frame,
+        applied_request.force_settings,
+        applied_request.strain_settings,
+        applied_request.y_column,
+        applied_request.y_settings,
+        applied_request.physical_settings,
+        applied_request.r2_threshold,
+        applied_request.min_points,
+        applied_request.epsilon_start,
+    )
+    render_background_postprocessing(
+        future,
+        normalize_axis_column(applied_request.y_column),
+        labels,
+        applied_request.show_legend,
+        applied_request.y_scale,
+        applied_request.show_window,
+        applied_request.show_slope,
+        plot_targets,
+    )
+
+
+def render_background_postprocessing(
+    future: Future[Any],
+    y_column: str,
+    labels: dict[str, str],
+    show_legend: bool,
+    y_scale: str,
+    show_window: bool,
+    show_slope: bool,
+    targets: tuple[Any, Any, Any],
+) -> None:
+    if future.done():
+        try:
+            analysis: PostprocessingAnalysis = future.result()
+        except Exception as exc:  # pragma: no cover
+            st.error(f"Postprocessing failed: {exc}")
+            render_postprocessing_plot_layout(
+                None,
+                y_column,
+                labels,
+                show_legend=False,
+                y_scale=y_scale,
+                show_window=show_window,
+                show_slope=show_slope,
+                targets=targets,
+            )
+            return
+        if analysis.warnings:
+            with st.expander(
+                f"Postprocessing warnings ({len(analysis.warnings)})"
+            ):
+                for warning in analysis.warnings:
+                    st.caption(warning)
+        render_postprocessing_plot_layout(
+            analysis,
+            y_column,
+            labels,
+            show_legend,
+            y_scale,
+            show_window,
+            show_slope,
+            targets,
+        )
+        render_working_window_results(analysis, labels)
+        return
+
+    render_postprocessing_plot_layout(
+        None,
+        y_column,
+        labels,
+        show_legend=False,
+        y_scale=y_scale,
+        show_window=show_window,
+        show_slope=show_slope,
+        targets=targets,
+    )
+
+    @st.fragment(run_every=0.75)
+    def pending_postprocessing() -> None:
+        if (
+            normalize_workspace(st.session_state.get("workspace"))
+            != WORKSPACE_POSTPROCESSING
+        ):
+            st.rerun()
+        if future.done():
+            st.rerun()
+        st.caption("Calculating working windows in the background...")
+
+    pending_postprocessing()
+
+def configure_postprocessing_figure(
+    figure: go.Figure,
+    x_column: str,
+    y_column: str,
+    height: int,
+    show_legend: bool,
+    y_scale: str = "linear",
+) -> go.Figure:
+    figure.update_layout(
+        height=height,
+        margin={"l": 8, "r": 8, "t": 12, "b": 24},
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        showlegend=show_legend,
+        hovermode="closest",
+        font={"color": "#344054", "size": 11},
+        legend={
+            "orientation": "h",
+            "y": 1.02,
+            "x": 0,
+            "font": {"size": 9},
+        },
+    )
+    figure.update_xaxes(title=column_axis_title(x_column), type="linear")
+    figure.update_yaxes(
+        title=column_axis_title(y_column),
+        type=normalize_axis_scale(y_scale),
+    )
+    style_axes(figure)
+    return figure
+
+
+def add_windowed_trace(
+    figure: go.Figure,
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    in_window: np.ndarray,
+    color: str,
+    name: str,
+    show_legend: bool,
+    show_window: bool,
+) -> None:
+    x_values = np.asarray(x_values, dtype=float)
+    y_values = np.asarray(y_values, dtype=float)
+    in_window = np.asarray(in_window, dtype=bool)
+    finite = np.isfinite(x_values) & np.isfinite(y_values)
+    finite_positions = np.flatnonzero(finite)
+    inside_positions = np.flatnonzero(finite & in_window)
+
+    def add_trace(
+        positions: np.ndarray,
+        line_color: str,
+        line_width: float,
+        legend: bool,
+        suffix: str = "",
+    ) -> None:
+        if not positions.size:
+            return
+        figure.add_trace(go.Scatter(
+            x=x_values[positions],
+            y=y_values[positions],
+            mode="lines",
+            line={"color": line_color, "width": line_width},
+            name=name,
+            showlegend=legend,
+            hovertemplate=(
+                f"{name}{suffix}<br>x: %{{x:.5g}}<br>y: %{{y:.5g}}"
+                "<extra></extra>"
+            ),
+        ))
+
+    if not show_window:
+        add_trace(finite_positions, color, 1.9, show_legend)
+        return
+    if not inside_positions.size:
+        add_trace(
+            finite_positions,
+            "rgba(107, 114, 128, 0.34)",
+            2.2,
+            show_legend,
+            " · outside window",
+        )
+        return
+
+    add_trace(inside_positions, color, 1.9, show_legend)
+    first_inside = int(inside_positions[0])
+    last_inside = int(inside_positions[-1])
+    before = finite_positions[finite_positions < first_inside]
+    after = finite_positions[finite_positions > last_inside]
+    if before.size:
+        before = np.concatenate((before, [first_inside]))
+        add_trace(
+            before,
+            "rgba(107, 114, 128, 0.34)",
+            2.2,
+            False,
+            " · outside window",
+        )
+    if after.size:
+        after = np.concatenate(([last_inside], after))
+        add_trace(
+            after,
+            "rgba(107, 114, 128, 0.34)",
+            2.2,
+            False,
+            " · outside window",
+        )
+
+
+def make_postprocessing_figures(
+    analysis: PostprocessingAnalysis | None,
+    y_column: str,
+    labels: dict[str, str],
+    show_legend: bool,
+    y_scale: str = "linear",
+    show_window: bool = True,
+    show_slope: bool = True,
+) -> tuple[go.Figure, go.Figure, go.Figure]:
+    top_figure = configure_postprocessing_figure(
+        go.Figure(),
+        "time_from_onset_s",
+        y_column,
+        POSTPROCESSING_SMALL_PLOT_HEIGHT,
+        show_legend,
+        y_scale,
+    )
+    strain_figure = configure_postprocessing_figure(
+        go.Figure(),
+        "time_from_onset_s",
+        "radial_Hencky_strain",
+        POSTPROCESSING_SMALL_PLOT_HEIGHT,
+        False,
+        "linear",
+    )
+    right_figure = configure_postprocessing_figure(
+        go.Figure(),
+        "radial_Hencky_strain",
+        y_column,
+        POSTPROCESSING_TALL_PLOT_HEIGHT,
+        False,
+        y_scale,
+    )
+    if analysis is None or analysis.frame.empty:
+        return top_figure, strain_figure, right_figure
+
+    source_files = (
+        analysis.frame["source_file"].astype(str).drop_duplicates().tolist()
+    )
+    source_colors = {
+        source_file: IFF_PALETTE[index % len(IFF_PALETTE)]
+        for index, source_file in enumerate(source_files)
+    }
+    shade_details: list[
+        tuple[float, float, float, float, float, float, float, float]
+    ] = []
+
+    for source_file in source_files:
+        group = analysis.frame[
+            analysis.frame["source_file"].astype(str) == source_file
+        ].sort_values("time_from_onset_s")
+        series_name = labels.get(source_file, source_file)
+        color = source_colors[source_file]
+        window = analysis.windows.get(source_file)
+        valid_strain = group[[
+            "time_from_onset_s", "radial_Hencky_strain"
+        ]].dropna()
+        if valid_strain.empty:
+            continue
+
+        default_start = (
+            0,
+            float(valid_strain.iloc[0]["time_from_onset_s"]),
+            float(valid_strain.iloc[0]["radial_Hencky_strain"]),
+        )
+        start_index, start_time, start_strain = analysis.window_starts.get(
+            source_file, default_start
+        )
+        endpoint_time: float | None = None
+        endpoint_strain: float | None = None
+        if (
+            window is not None
+            and window.valid
+            and window.endpoint_index is not None
+            and window.endpoint_index < len(valid_strain)
+        ):
+            endpoint_row = valid_strain.iloc[window.endpoint_index]
+            endpoint_time = float(endpoint_row["time_from_onset_s"])
+            endpoint_strain = float(endpoint_row["radial_Hencky_strain"])
+
+        time_values = pd.to_numeric(
+            group["time_from_onset_s"], errors="coerce"
+        ).to_numpy(dtype=float)
+        strain_values = pd.to_numeric(
+            group["radial_Hencky_strain"], errors="coerce"
+        ).to_numpy(dtype=float)
+        y_values = pd.to_numeric(
+            group[y_column], errors="coerce"
+        ).to_numpy(dtype=float)
+        in_window = (
+            np.isfinite(time_values)
+            & (time_values >= start_time)
+            & (time_values <= endpoint_time)
+            if endpoint_time is not None
+            else np.zeros(time_values.shape, dtype=bool)
+        )
+
+        add_windowed_trace(
+            top_figure,
+            time_values,
+            y_values,
+            in_window,
+            color,
+            series_name,
+            show_legend,
+            show_window,
+        )
+        add_windowed_trace(
+            strain_figure,
+            time_values,
+            strain_values,
+            in_window,
+            color,
+            series_name,
+            False,
+            show_window,
+        )
+        add_windowed_trace(
+            right_figure,
+            strain_values,
+            y_values,
+            in_window,
+            color,
+            series_name,
+            False,
+            show_window,
+        )
+
+        finite_times = time_values[np.isfinite(time_values)]
+        finite_strain = strain_values[np.isfinite(strain_values)]
+        if endpoint_time is None or endpoint_strain is None or window is None:
+            continue
+
+        fit_x = valid_strain["time_from_onset_s"].to_numpy(dtype=float)[
+            start_index : window.endpoint_index + 1
+        ]
+        if show_slope and fit_x.size:
+            fit_y = window.slope * fit_x + window.intercept
+            strain_figure.add_trace(go.Scatter(
+                x=fit_x,
+                y=fit_y,
+                mode="lines",
+                line={"color": color, "width": 1.4, "dash": "dash"},
+                name=f"{series_name} fit",
+                showlegend=False,
+                hoverinfo="skip",
+            ))
+        if show_window:
+            strain_figure.add_trace(go.Scatter(
+                x=[start_time, endpoint_time],
+                y=[start_strain, endpoint_strain],
+                mode="markers",
+                marker={
+                    "color": color,
+                    "size": 8,
+                    "line": {"color": "#ffffff", "width": 1.5},
+                },
+                name=f"{series_name} window",
+                showlegend=False,
+                hovertemplate=(
+                    f"{series_name}<br>t: %{{x:.5g}} s<br>"
+                    "εᵣ: %{y:.5g}<extra></extra>"
+                ),
+            ))
+            guide_style = {
+                "color": color,
+                "width": 1.1,
+                "dash": "dot",
+            }
+            for boundary_time, boundary_strain in (
+                (start_time, start_strain),
+                (endpoint_time, endpoint_strain),
+            ):
+                strain_figure.add_shape(
+                    type="line",
+                    x0=boundary_time,
+                    x1=boundary_time,
+                    y0=0.0,
+                    y1=boundary_strain,
+                    line=guide_style,
+                )
+                strain_figure.add_shape(
+                    type="line",
+                    x0=0.0,
+                    x1=boundary_time,
+                    y0=boundary_strain,
+                    y1=boundary_strain,
+                    line=guide_style,
+                )
+
+        if finite_times.size and finite_strain.size:
+            shade_details.append((
+                float(np.min(finite_times)),
+                start_time,
+                endpoint_time,
+                float(np.max(finite_times)),
+                float(np.min(finite_strain)),
+                start_strain,
+                endpoint_strain,
+                float(np.max(finite_strain)),
+            ))
+
+    if show_window and len(shade_details) == 1:
+        (
+            minimum_time,
+            start_time,
+            endpoint_time,
+            maximum_time,
+            minimum_strain,
+            start_strain,
+            endpoint_strain,
+            maximum_strain,
+        ) = shade_details[0]
+        for figure in (top_figure, strain_figure):
+            if minimum_time < start_time:
+                figure.add_vrect(
+                    x0=minimum_time,
+                    x1=start_time,
+                    fillcolor="#6B7280",
+                    opacity=0.10,
+                    line_width=0,
+                    layer="below",
+                )
+            if endpoint_time < maximum_time:
+                figure.add_vrect(
+                    x0=endpoint_time,
+                    x1=maximum_time,
+                    fillcolor="#6B7280",
+                    opacity=0.10,
+                    line_width=0,
+                    layer="below",
+                )
+        if minimum_strain < start_strain:
+            right_figure.add_vrect(
+                x0=minimum_strain,
+                x1=start_strain,
+                fillcolor="#6B7280",
+                opacity=0.10,
+                line_width=0,
+                layer="below",
+            )
+        if endpoint_strain < maximum_strain:
+            right_figure.add_vrect(
+                x0=endpoint_strain,
+                x1=maximum_strain,
+                fillcolor="#6B7280",
+                opacity=0.10,
+                line_width=0,
+                layer="below",
+            )
+    return top_figure, strain_figure, right_figure
+
+
+def render_postprocessing_plot_layout(
+    analysis: PostprocessingAnalysis | None,
+    y_column: str,
+    labels: dict[str, str],
+    show_legend: bool,
+    y_scale: str,
+    show_window: bool,
+    show_slope: bool,
+    targets: tuple[Any, Any, Any],
+) -> None:
+    top_figure, strain_figure, right_figure = make_postprocessing_figures(
+        analysis,
+        y_column,
+        labels,
+        show_legend,
+        y_scale,
+        show_window,
+        show_slope,
+    )
+    top_target, strain_target, right_target = targets
+    top_target.plotly_chart(
+        top_figure,
+        width="stretch",
+        config=plotly_config(),
+        key="postprocessing_top_plot",
+    )
+    strain_target.plotly_chart(
+        strain_figure,
+        width="stretch",
+        config=plotly_config(),
+        key="postprocessing_strain_plot",
+    )
+    right_target.plotly_chart(
+        right_figure,
+        width="stretch",
+        config=plotly_config(),
+        key="postprocessing_right_plot",
+    )
+
+def render_working_window_results(
+    analysis: PostprocessingAnalysis,
+    labels: dict[str, str],
+) -> None:
+    records: list[dict[str, Any]] = []
+    for source_file, window in analysis.windows.items():
+        start_index, start_time, start_strain = analysis.window_starts.get(
+            source_file, (0, None, None)
+        )
+        endpoint_strain = None
+        if window.endpoint_index is not None:
+            valid_strain = analysis.frame[
+                analysis.frame["source_file"].astype(str) == source_file
+            ].sort_values("time_from_onset_s")[[
+                "time_from_onset_s", "radial_Hencky_strain"
+            ]].dropna()
+            if window.endpoint_index < len(valid_strain):
+                endpoint_strain = float(
+                    valid_strain.iloc[window.endpoint_index][
+                        "radial_Hencky_strain"
+                    ]
+                )
+        record: dict[str, Any] = {
+            "Data": labels.get(source_file, source_file),
+            "Points": (
+                window.endpoint_index - start_index + 1
+                if window.endpoint_index is not None
+                else None
+            ),
+            "Start time [s]": start_time,
+            "Start εᵣ [-]": start_strain,
+            "End time [s]": window.endpoint_x,
+            "End εᵣ [-]": endpoint_strain,
+            "Slope [s⁻¹]": window.slope,
+            "Intercept": window.intercept,
+            "R²": window.r2,
+        }
+        records.append(record)
+    if not records:
+        return
+    with st.expander("Working-window results"):
+        st.dataframe(
+            pd.DataFrame.from_records(records),
+            width="stretch",
+            hide_index=True,
+        )
 
 def restore_summary_controls(file_summary: pd.DataFrame) -> None:
     request = st.session_state.get("summary_applied_request")
@@ -3837,20 +5387,6 @@ def render_summary_workspace(
 
     materials = sorted(file_summary["material"].dropna().astype(str).unique())
     velocities = sorted_velocity_values(file_summary["velocity"])
-    filter_columns = st.columns(2, gap="small")
-    with filter_columns[0]:
-        selected_materials = render_filter_dropdown(
-            "summary", "Material", materials
-        )
-    with filter_columns[1]:
-        selected_velocities = render_filter_dropdown(
-            "summary", "Velocity", velocities
-        )
-
-    eligible = file_summary[
-        file_summary["material"].astype(str).isin(selected_materials)
-        & file_summary["velocity"].astype(str).isin(selected_velocities)
-    ]
     st.session_state.setdefault("summary_x", "radial_Hencky_strain")
     st.session_state.setdefault("summary_y", "net_stress_Pa")
     st.session_state["summary_x"] = normalize_axis_column(
@@ -3901,11 +5437,23 @@ def render_summary_workspace(
         )
 
     selection_columns = st.columns(
-        [5.4, 1.0], gap="small", vertical_alignment="top"
+        [1.0, 1.0, 3.2, 1.0], gap="small", vertical_alignment="top"
     )
     with selection_columns[0]:
-        selected_files, runs_done = render_file_selector("summary", eligible)
+        selected_materials = render_filter_dropdown(
+            "summary", "Material", materials
+        )
     with selection_columns[1]:
+        selected_velocities = render_filter_dropdown(
+            "summary", "Velocity", velocities
+        )
+    eligible = file_summary[
+        file_summary["material"].astype(str).isin(selected_materials)
+        & file_summary["velocity"].astype(str).isin(selected_velocities)
+    ]
+    with selection_columns[2]:
+        selected_files, runs_done = render_data_selector("summary", eligible)
+    with selection_columns[3]:
         update_requested = st.button(
             "Update plots",
             key="summary_update",
@@ -4144,7 +5692,7 @@ def restore_frequency_controls(file_summary: pd.DataFrame) -> None:
         st.session_state["frequency_peak_max"],
         st.session_state["frequency_peak_count"],
         st.session_state["frequency_energy_bins"],
-        st.session_state["frequency_histogram_bins"],
+        st.session_state["frequency_histogram_bin_width_hz"],
     ) = request.peak_settings
     st.session_state["frequency_individual_plot"] = request.individual_plot
     st.session_state["frequency_summary_plot"] = request.summary_plot
@@ -4212,7 +5760,7 @@ def render_frequency_individual_view_controls(
     y_key = "frequency_individual_y_scale"
     plot_key = "frequency_individual_scale_for_plot"
     st.session_state.setdefault("frequency_show_peaks", True)
-    st.session_state.setdefault("frequency_show_legend", True)
+    st.session_state.setdefault("frequency_show_legend", False)
     st.session_state.setdefault(x_key, "Linear")
     if st.session_state.get(plot_key) != plot_name:
         st.session_state[y_key] = "Log" if plot_name == "PSD" else "Linear"
@@ -4250,12 +5798,6 @@ def render_frequency_individual_view_controls(
     )
 
 
-def render_frequency_row_label(label: str) -> None:
-    st.markdown(
-        f'<div class="frequency-row-label">{label}</div>',
-        unsafe_allow_html=True,
-    )
-
 
 def render_frequency_workspace(
     file_summary: pd.DataFrame,
@@ -4263,36 +5805,83 @@ def render_frequency_workspace(
     physical_settings: PhysicalSettings,
 ) -> None:
     applied_key = "frequency_applied_request"
+    defaults_version_key = "_frequency_defaults_v2"
+    if not st.session_state.get(defaults_version_key, False):
+        reset_keys = {
+            applied_key,
+            "frequency_signal",
+            "frequency_filter_formula",
+            "frequency_filter_source",
+            "frequency_individual_plot",
+            "frequency_summary_plot",
+            "frequency_show_legend",
+            "frequency_peak_min",
+            "frequency_peak_max",
+            "frequency_peak_count",
+            "frequency_energy_bins",
+            "frequency_histogram_bins",
+            "frequency_histogram_bin_width_hz",
+            "_frequency_runs_defaulted_all_v1",
+        }
+        for key in list(st.session_state):
+            if key in reset_keys or key.startswith(
+                ("frequency_material_", "frequency_velocity_", "frequency_file_")
+            ):
+                st.session_state.pop(key, None)
+        st.session_state[defaults_version_key] = True
     if st.session_state.get("_restore_scope") == "frequency":
         restore_frequency_controls(file_summary)
         st.session_state.pop("_restore_scope", None)
 
-    materials = sorted(file_summary["material"].dropna().astype(str).unique())
-    velocities = sorted_velocity_values(file_summary["velocity"])
     st.session_state.setdefault("frequency_signal", "force_g")
     st.session_state.setdefault("frequency_individual_plot", "FFT")
     st.session_state.setdefault(
         "frequency_summary_plot", "Peak frequency histogram"
     )
 
-    with st.container(border=True, key="frequency_controls"):
-        st.markdown(
-            '<div class="plot-heading">Frequency controls</div>',
-            unsafe_allow_html=True,
-        )
-
-        data_columns = st.columns(
-            [0.42, 1, 1, 1.1],
+    materials = sorted(file_summary["material"].dropna().astype(str).unique())
+    velocities = sorted_velocity_values(file_summary["velocity"])
+    with st.container(border=True, key="frequency_toolbar_separate_v3"):
+        control_columns = st.columns(
+            [1.0, 1.0, 0.82, 0.82, 0.92, 1.0, 0.28],
             gap="small",
             vertical_alignment="center",
         )
-        with data_columns[0]:
-            render_frequency_row_label("Data")
-        with data_columns[1]:
+
+        with control_columns[0]:
+            variable_label, variable_control = st.columns(
+                [0.4, 0.6], gap=None, vertical_alignment="center"
+            )
+            with variable_label:
+                render_inline_label("Variable:")
+            with variable_control:
+                signal_column = st.selectbox(
+                    "Signal",
+                    AVAILABLE_COLUMNS,
+                    index=None,
+                    key="frequency_signal",
+                    label_visibility="collapsed",
+                    format_func=column_menu_label,
+                )
+
+        with control_columns[1]:
+            formula_label, formula_control = st.columns(
+                [0.38, 0.62], gap=None, vertical_alignment="center"
+            )
+            with formula_label:
+                render_inline_label("Formula:")
+            with formula_control:
+                filter_settings = render_processing_controls(
+                    "frequency",
+                    str(signal_column),
+                    show_axis_label=False,
+                )
+
+        with control_columns[2]:
             selected_materials = render_filter_dropdown(
                 "frequency", "Material", materials
             )
-        with data_columns[2]:
+        with control_columns[3]:
             selected_velocities = render_filter_dropdown(
                 "frequency", "Velocity", velocities
             )
@@ -4300,86 +5889,90 @@ def render_frequency_workspace(
             file_summary["material"].astype(str).isin(selected_materials)
             & file_summary["velocity"].astype(str).isin(selected_velocities)
         ]
-        with data_columns[3]:
-            selected_files, runs_done = render_file_selector("frequency", eligible)
-
-        analysis_columns = st.columns(
-            [0.42, 1, 1, 1.1],
-            gap="small",
-            vertical_alignment="center",
-        )
-        with analysis_columns[0]:
-            render_frequency_row_label("Analysis")
-        with analysis_columns[1]:
-            signal_column = st.selectbox(
-                "Signal",
-                AVAILABLE_COLUMNS,
-                index=None,
-                key="frequency_signal",
-                label_visibility="collapsed",
-                format_func=lambda value: (
-                    f"Signal: {column_display_label(value)}"
-                ),
+        with control_columns[4]:
+            selected_files, runs_done = render_data_selector(
+                "frequency", eligible, default_selected=True
             )
-        with analysis_columns[2]:
-            filter_settings = render_processing_controls(
-                "frequency", str(signal_column)
-            )
-        with analysis_columns[3]:
+        with control_columns[5]:
             peak_settings = render_peak_settings()
-
-        plot_columns = st.columns(
-            [0.42, 2.15, 0.65, 2.15, 0.65, 0.9],
-            gap="small",
-            vertical_alignment="center",
-        )
-        with plot_columns[0]:
-            render_frequency_row_label("Plots")
-        with plot_columns[1]:
-            individual_plot = st.selectbox(
-                "Individual plot",
-                ["FFT", "PSD", "Energy by frequency band"],
-                index=None,
-                key="frequency_individual_plot",
-                label_visibility="collapsed",
-                format_func=lambda value: f"Individual: {value}",
-            )
-        with plot_columns[2]:
-            (
-                show_peaks,
-                show_legend,
-                individual_x_scale,
-                individual_y_scale,
-            ) = render_frequency_individual_view_controls(
-                str(individual_plot)
-            )
-        with plot_columns[3]:
-            summary_plot = st.selectbox(
-                "Summary plot",
-                [
-                    "Peak frequency histogram",
-                    "Peak amplitude histogram",
-                    "Dominant frequency by run",
-                ],
-                index=None,
-                key="frequency_summary_plot",
-                label_visibility="collapsed",
-                format_func=lambda value: f"Summary: {value}",
-            )
-        with plot_columns[4]:
-            summary_x_scale, summary_y_scale = render_frequency_axis_controls(
-                "frequency_summary", str(summary_plot)
-            )
-        with plot_columns[5]:
+        with control_columns[6]:
             update_requested = st.button(
-                "Update",
+                "",
                 key="frequency_update",
                 type="primary",
                 icon=":material/refresh:",
                 width="stretch",
-                help="Apply all frequency-analysis controls.",
+                help="Update frequency-analysis plots",
             )
+    frequency_status = st.empty()
+    chart_columns = st.columns(2, gap="small")
+    with chart_columns[0]:
+        with st.container(border=True, key="frequency_individual_panel"):
+            title_column, selector_column, view_column = st.columns(
+                [0.2, 0.58, 0.22],
+                gap="small",
+                vertical_alignment="center",
+            )
+            with title_column:
+                render_inline_label("Individual:")
+            with selector_column:
+                individual_plot = st.selectbox(
+                    "Individual plot",
+                    ["FFT", "PSD", "Energy by frequency band"],
+                    key="frequency_individual_plot",
+                    label_visibility="collapsed",
+                )
+            with view_column:
+                (
+                    show_peaks,
+                    show_legend,
+                    individual_x_scale,
+                    individual_y_scale,
+                ) = render_frequency_individual_view_controls(
+                    str(individual_plot)
+                )
+            individual_chart_target = st.empty()
 
+    with chart_columns[1]:
+        with st.container(border=True, key="frequency_summary_panel"):
+            title_column, selector_column, axes_column = st.columns(
+                [0.2, 0.58, 0.22],
+                gap="small",
+                vertical_alignment="center",
+            )
+            with title_column:
+                render_inline_label("Summary:")
+            with selector_column:
+                summary_plot = st.selectbox(
+                    "Summary plot",
+                    [
+                        "Peak frequency histogram",
+                        "Peak amplitude histogram",
+                        "Dominant frequency by run",
+                    ],
+                    key="frequency_summary_plot",
+                    label_visibility="collapsed",
+                )
+            with axes_column:
+                (
+                    summary_x_scale,
+                    summary_y_scale,
+                ) = render_frequency_axis_controls(
+                    "frequency_summary", str(summary_plot)
+                )
+            summary_chart_target = st.empty()
+
+    render_empty_frequency_axes(
+        individual_chart_target,
+        summary_chart_target,
+        str(signal_column),
+        str(individual_plot),
+        str(summary_plot),
+        individual_x_scale,
+        individual_y_scale,
+        summary_x_scale,
+        summary_y_scale,
+    )
     draft_request = FrequencyRequest(
         selected_files=tuple(selected_files),
         signal_column=str(signal_column),
@@ -4404,12 +5997,47 @@ def render_frequency_workspace(
     if applied_request is not None and not hasattr(applied_request, "show_peaks"):
         applied_request = None
     if applied_request is None:
-        st.info("Choose data series and press Update.")
-        return
-    if repr(draft_request) != repr(applied_request):
-        st.caption("Controls changed. Press Update to apply them.")
+        applied_request = draft_request
+        st.session_state[applied_key] = applied_request
+    draft_analysis_key = frequency_analysis_key(draft_request)
+    applied_analysis_key = frequency_analysis_key(applied_request)
+    if draft_analysis_key != applied_analysis_key:
+        analysis_field_names = (
+            "runs",
+            "signal",
+            "formula",
+            "peak settings",
+            "materials",
+            "velocities",
+            "physics",
+        )
+        changed_fields = [
+            name
+            for name, draft_value, applied_value in zip(
+                analysis_field_names,
+                draft_analysis_key,
+                applied_analysis_key,
+            )
+            if draft_value != applied_value
+        ]
+        frequency_status.caption(
+            f"Changed: {', '.join(changed_fields)}. Press Update to apply."
+        )
+
+    applied_request = replace(
+        applied_request,
+        individual_plot=str(individual_plot),
+        summary_plot=str(summary_plot),
+        show_peaks=bool(show_peaks),
+        show_legend=bool(show_legend),
+        individual_x_scale=individual_x_scale,
+        individual_y_scale=individual_y_scale,
+        summary_x_scale=summary_x_scale,
+        summary_y_scale=summary_y_scale,
+    )
+    st.session_state[applied_key] = applied_request
     if not applied_request.selected_files:
-        st.info("No data series are applied to frequency analysis.")
+        frequency_status.info("No data series are applied to frequency analysis.")
         return
 
     raw_data, issues = load_selected_dataset(
@@ -4418,7 +6046,7 @@ def render_frequency_workspace(
     for issue in issues:
         st.warning(issue)
     if raw_data.empty:
-        st.info("No compatible rows were loaded for the applied data series.")
+        frequency_status.info("No compatible rows were loaded for the applied data series.")
         return
 
     applied_physics = applied_request.physical_settings
@@ -4434,31 +6062,40 @@ def render_frequency_workspace(
         if row["source_file"] in applied_request.selected_files
     }
     job_key = make_job_key(
-        "frequency-batch", signature, applied_request,
+        "frequency-batch",
+        signature,
+        frequency_analysis_key(applied_request),
     )
-    render_background_frequency(job_key, data, applied_request, labels)
+    render_background_frequency(
+        job_key,
+        data,
+        applied_request,
+        labels,
+        individual_chart_target,
+        summary_chart_target,
+    )
 
-def render_peak_settings() -> tuple[float, float, int, int, int]:
+def render_peak_settings() -> tuple[float, float, int, int, float]:
     defaults = {
-        "frequency_peak_min": 0.1,
-        "frequency_peak_max": 10.0,
+        "frequency_peak_min": 0.0,
+        "frequency_peak_max": 1000.0,
         "frequency_peak_count": 3,
         "frequency_energy_bins": 20,
-        "frequency_histogram_bins": 12,
+        "frequency_histogram_bin_width_hz": 10.0,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
 
     with st.popover(
-        "Peaks",
+        "Peak settings",
         icon=":material/finance:",
         width="stretch",
     ):
+        st.caption("Shared by the individual and summary frequency plots.")
         range_columns = st.columns(2, gap="small")
         peak_min = range_columns[0].number_input(
             "Minimum (Hz)",
             min_value=0.0,
-            value=None,
             step=0.1,
             key="frequency_peak_min",
         )
@@ -4479,30 +6116,42 @@ def render_peak_settings() -> tuple[float, float, int, int, int]:
             key="frequency_peak_count",
         )
         energy_bins = detail_columns[1].number_input(
-            "Energy bands",
+            "Energy band count",
             min_value=4,
             max_value=100,
             value=None,
             step=1,
             key="frequency_energy_bins",
+            help=(
+                "Number of equal-width frequency intervals used to integrate "
+                "the PSD in the Energy plot."
+            ),
         )
-        histogram_bins = detail_columns[2].number_input(
-            "Histogram bins",
-            min_value=3,
-            max_value=100,
+        histogram_bin_width_hz = detail_columns[2].number_input(
+            "Bin width (Hz)",
+            min_value=0.001,
+            max_value=1000.0,
             value=None,
-            step=1,
-            key="frequency_histogram_bins",
+            step=1.0,
+            key="frequency_histogram_bin_width_hz",
         )
     minimum = float(peak_min)
     maximum = max(minimum + 1e-9, float(peak_max))
-    return minimum, maximum, int(peak_count), int(energy_bins), int(histogram_bins)
+    return (
+        minimum,
+        maximum,
+        int(peak_count),
+        int(energy_bins),
+        float(histogram_bin_width_hz),
+    )
 
 def render_background_frequency(
     job_key: str,
     frame: pd.DataFrame,
     request: FrequencyRequest,
     series_labels: dict[str, str],
+    individual_chart_target: Any,
+    summary_chart_target: Any,
 ) -> None:
     future = submit_background_job(
         job_key,
@@ -4521,7 +6170,13 @@ def render_background_frequency(
     except Exception as exc:  # pragma: no cover
         st.error(f"Frequency analysis failed: {exc}")
         return
-    render_frequency_results(result, request, series_labels)
+    render_frequency_results(
+        result,
+        request,
+        series_labels,
+        individual_chart_target,
+        summary_chart_target,
+    )
 
 def math_axis_title(symbol: str, unit: str) -> str:
     return f"{symbol} [{unit}]"
@@ -4542,6 +6197,105 @@ def spectrum_axis_title(kind: str, signal_column: str) -> str:
     energy_unit = "-" if unit == "-" else f"{unit}<sup>2</sup>"
     return math_axis_title(f"<i>E</i>({symbol})", energy_unit)
 
+def frequency_individual_axis_titles(
+    plot_name: str,
+    signal_column: str,
+) -> tuple[str, str]:
+    spectrum_kind = "Energy" if plot_name == "Energy by frequency band" else plot_name
+    return (
+        math_axis_title("<i>f</i>", "Hz"),
+        spectrum_axis_title(spectrum_kind, signal_column),
+    )
+
+
+def frequency_summary_axis_titles(
+    plot_name: str,
+    signal_column: str,
+) -> tuple[str, str, bool]:
+    if plot_name == "Peak amplitude histogram":
+        return (
+            spectrum_axis_title("FFT", signal_column),
+            math_axis_title("<i>N</i><sub>p</sub>", "-"),
+            False,
+        )
+    if plot_name == "Dominant frequency by run":
+        return (
+            "Data series [-]",
+            math_axis_title("<i>f</i><sub>dom</sub>", "Hz"),
+            True,
+        )
+    return (
+        math_axis_title("<i>f</i><sub>p</sub>", "Hz"),
+        math_axis_title("<i>N</i><sub>p</sub>", "-"),
+        False,
+    )
+
+
+def make_empty_frequency_figure(
+    x_title: str,
+    y_title: str,
+    x_scale: str,
+    y_scale: str,
+    categorical_x: bool = False,
+) -> go.Figure:
+    figure = go.Figure()
+    configure_analysis_figure(
+        figure,
+        x_title,
+        y_title,
+        520,
+        x_scale,
+        y_scale,
+    )
+    if categorical_x:
+        figure.update_xaxes(type="category")
+    return figure
+
+
+def render_empty_frequency_axes(
+    individual_target: Any,
+    summary_target: Any,
+    signal_column: str,
+    individual_plot: str,
+    summary_plot: str,
+    individual_x_scale: str,
+    individual_y_scale: str,
+    summary_x_scale: str,
+    summary_y_scale: str,
+) -> None:
+    individual_x_title, individual_y_title = frequency_individual_axis_titles(
+        individual_plot,
+        signal_column,
+    )
+    summary_x_title, summary_y_title, categorical_x = (
+        frequency_summary_axis_titles(summary_plot, signal_column)
+    )
+    with individual_target.container():
+        st.plotly_chart(
+            make_empty_frequency_figure(
+                individual_x_title,
+                individual_y_title,
+                individual_x_scale,
+                individual_y_scale,
+            ),
+            width="stretch",
+            config=plotly_config(),
+            key="frequency_empty_individual",
+        )
+    with summary_target.container():
+        st.plotly_chart(
+            make_empty_frequency_figure(
+                summary_x_title,
+                summary_y_title,
+                summary_x_scale,
+                summary_y_scale,
+                categorical_x,
+            ),
+            width="stretch",
+            config=plotly_config(),
+            key="frequency_empty_summary",
+        )
+
 def scale_range(minimum: float, maximum: float, scale: str) -> list[float]:
     if normalize_axis_scale(scale) == "log":
         lower = max(float(minimum), np.finfo(float).tiny)
@@ -4554,6 +6308,8 @@ def render_frequency_results(
     batch: FrequencyBatchResult,
     request: FrequencyRequest,
     series_labels: dict[str, str],
+    individual_chart_target: Any,
+    summary_chart_target: Any,
 ) -> None:
     if not batch.results:
         st.error("Frequency analysis did not produce any valid run.")
@@ -4562,7 +6318,7 @@ def render_frequency_results(
                 st.caption(f"{source_file}: {message}")
         return
 
-    peak_min_hz, peak_max_hz, peak_count, _, histogram_bins = (
+    peak_min_hz, peak_max_hz, peak_count, _, histogram_bin_width_hz = (
         request.peak_settings
     )
     sample_rates = [result.sample_rate_hz for result in batch.results.values()]
@@ -4701,13 +6457,13 @@ def render_frequency_results(
     summary_figure = go.Figure()
     if not peak_table.empty:
         if request.summary_plot == "Peak frequency histogram":
-            bin_size = (peak_max_hz - peak_min_hz) / histogram_bins
+
             summary_figure.add_trace(go.Histogram(
                 x=peak_table["frequency_Hz"],
                 xbins={
                     "start": peak_min_hz,
                     "end": peak_max_hz,
-                    "size": bin_size,
+                    "size": histogram_bin_width_hz,
                 },
                 marker={"color": "#0075CF"},
                 hovertemplate=(
@@ -4719,7 +6475,7 @@ def render_frequency_results(
         elif request.summary_plot == "Peak amplitude histogram":
             summary_figure.add_trace(go.Histogram(
                 x=peak_table["amplitude"],
-                nbinsx=histogram_bins,
+
                 marker={"color": "#00A6A6"},
                 hovertemplate=(
                     "Amplitude: %{x:.4g}<br>Count: %{y}<extra></extra>"
@@ -4781,20 +6537,11 @@ def render_frequency_results(
             )
         )
 
-    chart_columns = st.columns(2, gap="small")
-    with chart_columns[0]:
-        st.markdown(
-            f'<div class="plot-heading">Individual: {request.individual_plot}</div>',
-            unsafe_allow_html=True,
-        )
+    with individual_chart_target.container():
         st.plotly_chart(
             individual_figure, width="stretch", config=plotly_config()
         )
-    with chart_columns[1]:
-        st.markdown(
-            f'<div class="plot-heading">Summary: {request.summary_plot}</div>',
-            unsafe_allow_html=True,
-        )
+    with summary_chart_target.container():
         st.plotly_chart(summary_figure, width="stretch", config=plotly_config())
 
     with st.expander(f"Detected peaks by run ({len(peak_table)})"):

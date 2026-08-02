@@ -9,8 +9,10 @@ from vader_dashboard import (
     add_derived_columns,
     analyze_frequency,
     analyze_frequency_runs,
+    analyze_postprocessing_runs,
     detect_fft_peaks,
     estimate_sampling_interval,
+    find_max_initial_linear_range,
     VARIANT_COLUMN,
     format_filter_formula,
     format_filter_workflow,
@@ -58,6 +60,58 @@ class DerivedQuantityTests(unittest.TestCase):
         )
 
 
+class LinearRangeTests(unittest.TestCase):
+    def test_initially_linear_then_curved_example(self) -> None:
+        x = np.arange(20, dtype=float)
+        y = 2.0 * x + 1.0
+        y[12:] += 3.0 * (x[12:] - 11.0) ** 2
+
+        result = find_max_initial_linear_range(
+            x,
+            y,
+            r2_threshold=0.999,
+            include_residuals=True,
+        )
+
+        self.assertEqual(result.endpoint_index, 11)
+        self.assertEqual(result.endpoint_x, 11.0)
+        self.assertAlmostEqual(result.slope, 2.0)
+        self.assertAlmostEqual(result.intercept, 1.0)
+        self.assertAlmostEqual(result.r2, 1.0)
+        np.testing.assert_allclose(result.residuals, 0.0)
+
+    def test_full_domain_and_constant_signal_pass(self) -> None:
+        x = np.linspace(0.0, 5.0, 21)
+        linear = find_max_initial_linear_range(
+            x, 4.0 * x - 3.0, r2_threshold=0.9999
+        )
+        constant = find_max_initial_linear_range(
+            x,
+            np.full_like(x, 7.5),
+            r2_threshold=0.9999,
+            constrain_to_first=True,
+        )
+
+        self.assertEqual(linear.endpoint_index, x.size - 1)
+        self.assertEqual(constant.endpoint_index, x.size - 1)
+        self.assertEqual(constant.slope, 0.0)
+        self.assertEqual(constant.intercept, 7.5)
+        self.assertEqual(constant.r2, 1.0)
+
+    def test_no_valid_interval_and_invalid_x_are_handled(self) -> None:
+        no_window = find_max_initial_linear_range(
+            np.arange(5, dtype=float),
+            np.array([0.0, 1.0, 0.0, 2.0, -1.0]),
+            r2_threshold=0.999,
+            min_points=3,
+        )
+        self.assertFalse(no_window.valid)
+        with self.assertRaisesRegex(ValueError, "strictly increasing"):
+            find_max_initial_linear_range(
+                np.array([0.0, 1.0, 1.0, 2.0]),
+                np.array([0.0, 1.0, 2.0, 3.0]),
+            )
+
 class PreprocessingTests(unittest.TestCase):
     def test_crop_and_tail_force_offset_drop_rows_above_threshold(self) -> None:
         frame = pd.DataFrame(
@@ -84,6 +138,34 @@ class PreprocessingTests(unittest.TestCase):
         time_s = np.array([0.0, 0.1, 0.2, 0.3, 2.3, np.nan])
         self.assertAlmostEqual(estimate_sampling_interval(time_s), 0.1)
 
+
+class PostprocessingAnalysisTests(unittest.TestCase):
+    def test_working_window_starts_at_requested_strain(self) -> None:
+        time_s = np.arange(10, dtype=float)
+        frame = pd.DataFrame({
+            "source_file": "run.csv",
+            "time_from_onset_s": time_s,
+            "radial_Hencky_strain": 0.5 * time_s,
+            "force_g": 2.0 * time_s,
+            "diameter_mm": np.full(time_s.size, 2.0),
+        })
+
+        result = analyze_postprocessing_runs(
+            frame,
+            FilterSettings(),
+            FilterSettings(),
+            "force_g",
+            FilterSettings(),
+            PhysicalSettings(),
+            r2_threshold=0.999,
+            min_points=3,
+            epsilon_start=1.0,
+        )
+
+        self.assertEqual(result.window_starts["run.csv"][0], 2)
+        self.assertAlmostEqual(result.window_starts["run.csv"][1], 2.0)
+        self.assertAlmostEqual(result.window_starts["run.csv"][2], 1.0)
+        self.assertEqual(result.windows["run.csv"].endpoint_index, 9)
 
 class SignalProcessingTests(unittest.TestCase):
     def setUp(self) -> None:
