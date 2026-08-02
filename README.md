@@ -148,5 +148,5 @@ hencky_strain_rate_1_s = d(radial_Hencky_strain) / dt
 extensional_viscosity_Pa_s = net_stress_Pa / hencky_strain_rate_1_s
 ```
 
-The default capillary factor is `2`. The force column is assumed to contain
+The default capillary factor is `2 / pi`. The force column is assumed to contain
 gram-force values.

@@ -44,11 +44,12 @@ class DerivedQuantityTests(unittest.TestCase):
 
         area_m2 = np.pi * (0.002 / 2.0) ** 2
         expected_stress = 9.80665e-3 / area_m2
-        expected_capillary = 2.0 * 0.072 / 0.002
+        expected_capillary = (2.0 / np.pi) * 0.072 / 0.002
         expected_net = expected_stress - expected_capillary
 
         self.assertAlmostEqual(result["area_mm2"].iloc[0], np.pi)
         self.assertAlmostEqual(result["stress_Pa"].iloc[0], expected_stress)
+        self.assertAlmostEqual(PhysicalSettings().capillary_factor, 2.0 / np.pi)
         self.assertAlmostEqual(
             result["surface_tension_stress_Pa"].iloc[0], expected_capillary
         )

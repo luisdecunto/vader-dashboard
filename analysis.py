@@ -35,7 +35,7 @@ TRACE_COLUMN = "trace_id"
 @dataclass(frozen=True)
 class PhysicalSettings:
     surface_tension_mN_m: float = 72.0
-    capillary_factor: float = 2.0
+    capillary_factor: float = 2.0 / np.pi
     force_zero_g: float = 0.0
     min_abs_strain_rate: float = 1e-5
     crop_enabled: bool = True
