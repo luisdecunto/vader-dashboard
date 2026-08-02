@@ -2684,7 +2684,7 @@ def render_plot_window(
             & file_summary["velocity"].astype(str).isin(selected_velocities)
         ]
         with action_group:
-            selected_files = render_file_selector(
+            selected_files, runs_done = render_file_selector(
                 selector_scope, eligible_summary
             )
             action_columns = st.columns(
@@ -2733,19 +2733,31 @@ def render_plot_window(
             selected_velocities=tuple(selected_velocities),
             physical_settings=physical_settings,
         )
-        if update_requested:
+        if update_requested or runs_done:
             st.session_state[applied_key] = draft_request
 
         applied_request = st.session_state.get(applied_key)
         if applied_request is not None and not hasattr(applied_request, "show_legend"):
             applied_request = None
         if applied_request is None:
-            st.info("No data series applied.")
+            render_empty_plot_figure(
+                x_column,
+                y_column,
+                x_scale,
+                y_scale,
+                key=f"{key_prefix}_empty",
+            )
             return
         if repr(draft_request) != repr(applied_request):
             st.caption("Controls changed. Press Update to apply them.")
         if not applied_request.selected_files:
-            st.info("No data series are applied to this plot.")
+            render_empty_plot_figure(
+                normalize_axis_column(applied_request.x_column),
+                normalize_axis_column(applied_request.y_column),
+                applied_request.x_scale,
+                applied_request.y_scale,
+                key=f"{key_prefix}_empty",
+            )
             return
 
         x_column = normalize_axis_column(applied_request.x_column)
@@ -3138,7 +3150,10 @@ def numerically_sorted_file_summary(file_summary: pd.DataFrame) -> pd.DataFrame:
     ).drop(columns=["_velocity_sort", "_velocity_text"])
 
 
-def render_file_selector(index: int | str, file_summary: pd.DataFrame) -> list[str]:
+def render_file_selector(
+    index: int | str,
+    file_summary: pd.DataFrame,
+) -> tuple[list[str], bool]:
     ordered_summary = numerically_sorted_file_summary(file_summary)
     files = ordered_summary["source_file"].tolist()
     for file_name in files:
@@ -3151,6 +3166,7 @@ def render_file_selector(index: int | str, file_summary: pd.DataFrame) -> list[s
         for file_name in files
     )
     popover_key = f"plot_{index}_series_popover"
+    done_requested = False
     with st.popover(
         f"Runs {selected_count}/{len(files)}",
         icon=":material/dataset:",
@@ -3191,7 +3207,7 @@ def render_file_selector(index: int | str, file_summary: pd.DataFrame) -> list[s
                 disabled=not files,
                 width="stretch",
             )
-            action_columns[2].form_submit_button(
+            done_requested = action_columns[2].form_submit_button(
                 "Done",
                 type="primary",
                 on_click=close_runs_selector,
@@ -3200,11 +3216,12 @@ def render_file_selector(index: int | str, file_summary: pd.DataFrame) -> list[s
                 width="stretch",
             )
 
-    return [
+    selected_files = [
         file_name
         for file_name in files
         if st.session_state[f"plot_{index}_file_{file_name}"]
     ]
+    return selected_files, bool(done_requested)
 
 
 def close_runs_selector(popover_key: str) -> None:
@@ -3504,6 +3521,48 @@ def make_processed_figure(
     )
     style_axes(figure)
     return figure
+
+
+def make_empty_plot_figure(
+    x_column: str,
+    y_column: str,
+    x_scale: str = "linear",
+    y_scale: str = "linear",
+) -> go.Figure:
+    figure = go.Figure()
+    figure.update_layout(
+        height=650,
+        margin={"l": 8, "r": 8, "t": 15, "b": 8},
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        showlegend=False,
+        font={"color": "#344054", "size": 11},
+    )
+    figure.update_xaxes(
+        title=column_axis_title(x_column),
+        type=normalize_axis_scale(x_scale),
+    )
+    figure.update_yaxes(
+        title=column_axis_title(y_column),
+        type=normalize_axis_scale(y_scale),
+    )
+    style_axes(figure)
+    return figure
+
+
+def render_empty_plot_figure(
+    x_column: str,
+    y_column: str,
+    x_scale: str,
+    y_scale: str,
+    key: str,
+) -> None:
+    st.plotly_chart(
+        make_empty_plot_figure(x_column, y_column, x_scale, y_scale),
+        width="stretch",
+        config=plotly_config(),
+        key=key,
+    )
 
 
 def render_plot_figure(
@@ -3845,7 +3904,7 @@ def render_summary_workspace(
         [5.4, 1.0], gap="small", vertical_alignment="top"
     )
     with selection_columns[0]:
-        selected_files = render_file_selector("summary", eligible)
+        selected_files, runs_done = render_file_selector("summary", eligible)
     with selection_columns[1]:
         update_requested = st.button(
             "Update plots",
@@ -3868,7 +3927,7 @@ def render_summary_workspace(
         selected_velocities=tuple(selected_velocities),
         physical_settings=physical_settings,
     )
-    if update_requested:
+    if update_requested or runs_done:
         st.session_state[applied_key] = draft_request
 
     applied_request = st.session_state.get(applied_key)
@@ -4242,7 +4301,7 @@ def render_frequency_workspace(
             & file_summary["velocity"].astype(str).isin(selected_velocities)
         ]
         with data_columns[3]:
-            selected_files = render_file_selector("frequency", eligible)
+            selected_files, runs_done = render_file_selector("frequency", eligible)
 
         analysis_columns = st.columns(
             [0.42, 1, 1, 1.1],
@@ -4338,7 +4397,7 @@ def render_frequency_workspace(
         selected_velocities=tuple(selected_velocities),
         physical_settings=physical_settings,
     )
-    if update_requested:
+    if update_requested or runs_done:
         st.session_state[applied_key] = draft_request
 
     applied_request = st.session_state.get(applied_key)

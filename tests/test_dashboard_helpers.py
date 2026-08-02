@@ -17,6 +17,7 @@ from vader_dashboard import (
     column_axis_title,
     column_display_label,
     column_menu_label,
+    make_empty_plot_figure,
     normalize_axis_column,
     normalize_workspace,
     parse_filter_formula,
@@ -116,6 +117,26 @@ class DashboardDisplayTests(unittest.TestCase):
         self.assertEqual(
             normalize_axis_column("hencky_strain"), "radial_Hencky_strain"
         )
+
+    def test_empty_plot_has_axes_but_no_data(self) -> None:
+        figure = make_empty_plot_figure(
+            "time_from_onset_s",
+            "force_g",
+            x_scale="linear",
+            y_scale="log",
+        )
+        self.assertEqual(len(figure.data), 0)
+        self.assertEqual(figure.layout.height, 650)
+        self.assertEqual(
+            figure.layout.xaxis.title.text,
+            column_axis_title("time_from_onset_s"),
+        )
+        self.assertEqual(
+            figure.layout.yaxis.title.text,
+            column_axis_title("force_g"),
+        )
+        self.assertEqual(figure.layout.xaxis.type, "linear")
+        self.assertEqual(figure.layout.yaxis.type, "log")
 
     def test_plot_labels_use_scientific_notation_and_units(self) -> None:
         self.assertEqual(column_display_label("radial_Hencky_strain"), "HS strain")
