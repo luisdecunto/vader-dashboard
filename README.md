@@ -144,7 +144,6 @@ area_m2 = pi * (diameter_mm * 1e-3 / 2)^2
 stress_Pa = force_N / area_m2
 surface_tension_stress_Pa = capillary_factor * surface_tension_N_m / diameter_m
 net_stress_Pa = stress_Pa - surface_tension_stress_Pa
-hencky_strain = radial_Hencky_strain
 hencky_strain_rate_1_s = d(radial_Hencky_strain) / dt
 extensional_viscosity_Pa_s = net_stress_Pa / hencky_strain_rate_1_s
 ```

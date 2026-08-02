@@ -6,6 +6,7 @@ from vader_dashboard import (
     DERIVED_QUANTITY_DEFINITIONS,
     FILTER_CONTROL_SPECS,
     PHYSICS_CONTROL_SPECS,
+    PROCESSED_AXIS_COLUMNS,
     PhysicalSettings,
     VELOCITY_COLUMN,
     WORKSPACE_DATA,
@@ -15,6 +16,8 @@ from vader_dashboard import (
     WORKSPACE_SUMMARY,
     column_axis_title,
     column_display_label,
+    column_menu_label,
+    normalize_axis_column,
     normalize_workspace,
     parse_filter_formula,
     parse_filter_formula_list,
@@ -89,10 +92,35 @@ class DashboardDisplayTests(unittest.TestCase):
             ["HS", "LP(HS,20)"],
         )
 
+    def test_axis_menus_use_math_notation_without_duplicate_strain(self) -> None:
+        self.assertEqual(
+            [column_menu_label(column) for column in PROCESSED_AXIS_COLUMNS],
+            [
+                "t",
+                "L\u1d65",
+                "\u03b5\u1d63",
+                "\u03b5_z",
+                "D/D\u2080",
+                "F",
+                "D",
+                "A",
+                "\u03c3",
+                "\u03c3_surf",
+                "\u0394\u03c3",
+                "\u03b5\u0307\u1d63",
+                "\u03b7\u2091",
+                "v",
+            ],
+        )
+        self.assertNotIn("hencky_strain", PROCESSED_AXIS_COLUMNS)
+        self.assertEqual(
+            normalize_axis_column("hencky_strain"), "radial_Hencky_strain"
+        )
+
     def test_plot_labels_use_scientific_notation_and_units(self) -> None:
         self.assertEqual(column_display_label("radial_Hencky_strain"), "HS strain")
         self.assertEqual(column_display_label(VELOCITY_COLUMN), "Velocity")
-        self.assertIn("ε<sub>HS</sub>", column_axis_title("radial_Hencky_strain"))
+        self.assertIn("ε<sub>r</sub>", column_axis_title("radial_Hencky_strain"))
         self.assertIn("[-]", column_axis_title("radial_Hencky_strain"))
         self.assertIn("mm s<sup>-1</sup>", column_axis_title(VELOCITY_COLUMN))
 

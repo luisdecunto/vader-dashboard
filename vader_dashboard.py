@@ -172,34 +172,43 @@ class DerivedQuantityDefinition:
     axis_symbol: str
     unit: str
     log_y: bool = False
+    menu_label: str | None = None
 
 
 BUILTIN_DERIVED_QUANTITIES = (
-    DerivedQuantityDefinition("area_mm2", "Area", "<i>A</i>", "mm<sup>2</sup>"),
-    DerivedQuantityDefinition("stress_Pa", "Stress", "\u03c3", "Pa"),
+    DerivedQuantityDefinition(
+        "area_mm2", "Area", "<i>A</i>", "mm<sup>2</sup>", menu_label="A"
+    ),
+    DerivedQuantityDefinition(
+        "stress_Pa", "Stress", "\u03c3", "Pa", menu_label="\u03c3"
+    ),
     DerivedQuantityDefinition(
         "surface_tension_stress_Pa",
         "Surface-tension stress",
-        "\u03c3<sub>\u03b3</sub>",
+        "\u03c3<sub>surf</sub>",
         "Pa",
+        menu_label="\u03c3_surf",
     ),
     DerivedQuantityDefinition(
-        "net_stress_Pa", "Net stress", "\u03c3<sub>net</sub>", "Pa"
-    ),
-    DerivedQuantityDefinition(
-        "hencky_strain", "HS strain (derived)", "\u03b5<sub>HS</sub>", "-"
+        "net_stress_Pa",
+        "Net stress",
+        "\u0394\u03c3",
+        "Pa",
+        menu_label="\u0394\u03c3",
     ),
     DerivedQuantityDefinition(
         "hencky_strain_rate_1_s",
         "HS strain rate",
-        "\u03b5\u0307<sub>HS</sub>",
+        "\u03b5\u0307<sub>r</sub>",
         "s<sup>-1</sup>",
+        menu_label="\u03b5\u0307\u1d63",
     ),
     DerivedQuantityDefinition(
         "extensional_viscosity_Pa_s",
         "Extensional viscosity",
-        "\u03b7<sub>E</sub>",
+        "\u03b7<sub>e</sub>",
         "Pa s",
+        menu_label="\u03b7\u2091",
         log_y=True,
     ),
 )
@@ -233,12 +242,23 @@ COLUMN_DISPLAY_LABELS = {
 COLUMN_AXIS_SYMBOLS = {
     "time_from_onset_s": "<i>t</i>",
     "vertical_distance_L": "<i>L</i><sub>v</sub>",
-    "radial_Hencky_strain": "\u03b5<sub>HS</sub>",
+    "radial_Hencky_strain": "\u03b5<sub>r</sub>",
     "vertical_strain": "\u03b5<sub>z</sub>",
     "D_over_D0": "<i>D</i>/<i>D</i><sub>0</sub>",
     "force_g": "<i>F</i>",
     "diameter_mm": "<i>D</i>",
     VELOCITY_COLUMN: "<i>v</i>",
+}
+# Selectbox options are plain text, so Unicode mirrors the plot's math notation.
+COLUMN_MENU_LABELS = {
+    "time_from_onset_s": "t",
+    "vertical_distance_L": "L\u1d65",
+    "radial_Hencky_strain": "\u03b5\u1d63",
+    "vertical_strain": "\u03b5_z",
+    "D_over_D0": "D/D\u2080",
+    "force_g": "F",
+    "diameter_mm": "D",
+    VELOCITY_COLUMN: "v",
 }
 COLUMN_UNITS = {
     "time_from_onset_s": "s",
@@ -254,6 +274,9 @@ for _definition in DERIVED_QUANTITY_DEFINITIONS:
     COLUMN_DISPLAY_LABELS[_definition.column] = _definition.display_label
     COLUMN_AXIS_SYMBOLS[_definition.column] = _definition.axis_symbol
     COLUMN_UNITS[_definition.column] = _definition.unit
+    COLUMN_MENU_LABELS[_definition.column] = (
+        _definition.menu_label or _definition.display_label
+    )
 
 
 def add_custom_derived_columns(
@@ -507,6 +530,17 @@ CUSTOM_FILTER_EXECUTORS: dict[str, CustomFilterExecutor] = {}
 def column_display_label(column: str) -> str:
     return COLUMN_DISPLAY_LABELS.get(column, column)
 
+
+def column_menu_label(column: str) -> str:
+    return COLUMN_MENU_LABELS.get(column, column)
+
+
+def normalize_axis_column(column: object) -> str:
+    return (
+        "radial_Hencky_strain"
+        if str(column) == "hencky_strain"
+        else str(column)
+    )
 
 
 def formula_source_label(source_column: str) -> str:
@@ -975,15 +1009,14 @@ def add_derived_columns(
         result["stress_Pa"] - result["surface_tension_stress_Pa"]
     )
 
-    result["hencky_strain"] = pd.to_numeric(
-        result["radial_Hencky_strain"], errors="coerce"
-    )
-
     result["hencky_strain_rate_1_s"] = np.nan
+
     for _, group in result.groupby("source_file", sort=False):
         ordered = group.sort_values("time_from_onset_s")
         times = ordered["time_from_onset_s"].to_numpy(dtype=float)
-        strain = ordered["hencky_strain"].to_numpy(dtype=float)
+        strain = pd.to_numeric(
+            ordered["radial_Hencky_strain"], errors="coerce"
+        ).to_numpy(dtype=float)
         valid = np.isfinite(times) & np.isfinite(strain)
         if valid.sum() < 3:
             continue
@@ -2477,8 +2510,8 @@ def restore_plot_controls(
     if request is None or not hasattr(request, "show_legend"):
         return
 
-    st.session_state[f"{key_prefix}_x"] = request.x_column
-    st.session_state[f"{key_prefix}_y"] = request.y_column
+    st.session_state[f"{key_prefix}_x"] = normalize_axis_column(request.x_column)
+    st.session_state[f"{key_prefix}_y"] = normalize_axis_column(request.y_column)
     st.session_state[f"{key_prefix}_show_legend"] = request.show_legend
     st.session_state[f"{key_prefix}_x_scale"] = request.x_scale.title()
     st.session_state[f"{key_prefix}_y_scale"] = request.y_scale.title()
@@ -2566,13 +2599,18 @@ def render_axis_selector(
     with row[0]:
         render_inline_label(f"{axis_name}:")
     with row[1]:
+        state_key = f"{key_prefix}_{axis_name.lower()}"
+        if state_key in st.session_state:
+            st.session_state[state_key] = normalize_axis_column(
+                st.session_state[state_key]
+            )
         selected = st.selectbox(
             f"{axis_name} axis",
             axis_options,
             index=None,
-            key=f"{key_prefix}_{axis_name.lower()}",
+            key=state_key,
             label_visibility="collapsed",
-            format_func=column_display_label,
+            format_func=column_menu_label,
         )
     return str(selected)
 
@@ -2631,11 +2669,11 @@ def render_plot_window(
 
         if allow_processing:
             with control_groups[2]:
-                force_variants = render_formula_variant_controls(
-                    f"{key_prefix}_force", "Force", "force_g"
-                )
                 strain_variants = render_formula_variant_controls(
                     f"{key_prefix}_strain", "HS", "radial_Hencky_strain"
+                )
+                force_variants = render_formula_variant_controls(
+                    f"{key_prefix}_force", "Force", "force_g"
                 )
             action_group = control_groups[3]
         else:
@@ -2710,8 +2748,8 @@ def render_plot_window(
             st.info("No data series are applied to this plot.")
             return
 
-        x_column = applied_request.x_column
-        y_column = applied_request.y_column
+        x_column = normalize_axis_column(applied_request.x_column)
+        y_column = normalize_axis_column(applied_request.y_column)
         selected_files = list(applied_request.selected_files)
         force_variants = applied_request.force_variants
         strain_variants = applied_request.strain_variants
@@ -3699,14 +3737,16 @@ def restore_summary_controls(file_summary: pd.DataFrame) -> None:
     request = st.session_state.get("summary_applied_request")
     if request is None or not hasattr(request, "show_legend"):
         return
-    st.session_state["summary_x"] = request.x_column
-    st.session_state["summary_y"] = request.y_column
+    st.session_state["summary_x"] = normalize_axis_column(request.x_column)
+    st.session_state["summary_y"] = normalize_axis_column(request.y_column)
     st.session_state["summary_group_by"] = request.group_by
     st.session_state["summary_bins"] = request.bin_count
     st.session_state["summary_show_legend"] = request.show_legend
     st.session_state["summary_x_scale"] = request.x_scale.title()
     st.session_state["summary_y_scale"] = request.y_scale.title()
-    st.session_state["summary_scale_for_y"] = request.y_column
+    st.session_state["summary_scale_for_y"] = normalize_axis_column(
+        request.y_column
+    )
     restore_selection_controls(
         "summary",
         file_summary,
@@ -3744,6 +3784,12 @@ def render_summary_workspace(
     ]
     st.session_state.setdefault("summary_x", "radial_Hencky_strain")
     st.session_state.setdefault("summary_y", "net_stress_Pa")
+    st.session_state["summary_x"] = normalize_axis_column(
+        st.session_state["summary_x"]
+    )
+    st.session_state["summary_y"] = normalize_axis_column(
+        st.session_state["summary_y"]
+    )
     st.session_state.setdefault("summary_group_by", "Material")
     st.session_state.setdefault("summary_bins", 100)
     control_columns = st.columns([1.7, 1.7, 1.35, 0.8, 0.75], gap="small")
@@ -3753,7 +3799,7 @@ def render_summary_workspace(
             PROCESSED_AXIS_COLUMNS,
             index=None,
             key="summary_x",
-            format_func=column_display_label,
+            format_func=column_menu_label,
         )
     with control_columns[1]:
         y_column = st.selectbox(
@@ -3761,7 +3807,7 @@ def render_summary_workspace(
             PROCESSED_AXIS_COLUMNS,
             index=None,
             key="summary_y",
-            format_func=column_display_label,
+            format_func=column_menu_label,
         )
     with control_columns[2]:
         group_by = st.selectbox(
@@ -3837,12 +3883,14 @@ def render_summary_workspace(
         return
 
     applied_physics = applied_request.physical_settings
+    applied_x_column = normalize_axis_column(applied_request.x_column)
+    applied_y_column = normalize_axis_column(applied_request.y_column)
     preprocessed = preprocess_dataset(raw_data, applied_physics)
     data = derive_dataset(preprocessed.frame, applied_physics)
     summary, peaks = build_summary_tables(
         data,
-        applied_request.x_column,
-        applied_request.y_column,
+        applied_x_column,
+        applied_y_column,
         applied_request.group_by,
         applied_request.bin_count,
     )
@@ -3852,8 +3900,8 @@ def render_summary_workspace(
 
     mean_figure = make_summary_mean_figure(
         summary,
-        applied_request.x_column,
-        applied_request.y_column,
+        applied_x_column,
+        applied_y_column,
         applied_request.show_legend,
         applied_request.x_scale,
         applied_request.y_scale,
@@ -3867,7 +3915,7 @@ def render_summary_workspace(
         color_discrete_sequence=IFF_PALETTE,
         labels={
             "group": applied_request.group_by,
-            "peak": "Peak " + column_axis_title(applied_request.y_column),
+            "peak": "Peak " + column_axis_title(applied_y_column),
         },
     )
     peak_figure.update_layout(

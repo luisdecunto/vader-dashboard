@@ -51,6 +51,7 @@ class DerivedQuantityTests(unittest.TestCase):
             result["surface_tension_stress_Pa"].iloc[0], expected_capillary
         )
         self.assertAlmostEqual(result["net_stress_Pa"].iloc[0], expected_net)
+        self.assertNotIn("hencky_strain", result.columns)
         np.testing.assert_allclose(result["hencky_strain_rate_1_s"], 0.1)
         np.testing.assert_allclose(
             result["extensional_viscosity_Pa_s"], expected_net / 0.1
