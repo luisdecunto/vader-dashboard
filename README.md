@@ -83,18 +83,18 @@ marker.
 
 ## Interface
 
-- A fixed icon rail switches between Filtered / processed, Raw data, Frequency analysis, and Summary plots.
+- A fixed icon rail follows the workflow: Data, Frequency analysis, Postprocessing, and Summary.
 - Hovering or focusing the rail expands it as an overlay, so the plot area never resizes.
 - Physical settings remain available from the fixed top-right toolbar without taking plot space.
-- Raw data contains the original CSV variables and no processing controls.
-- Filtered / processed contains derived variables and independent background-processing controls for both plots.
+- Data contains measured and derived variables with independent background-processing controls for both plots.
+- Postprocessing is reserved for the upcoming feature-extraction workflow.
 - Plot View menus control raw overlays, legends, and independent linear/log axis scales.
 - Velocity is available as a numeric X or Y variable and velocity choices sort numerically.
 - Plot labels use scientific symbols, subscripts, superscripts, and bracketed units.
 - Data-series panels stay open while selecting multiple runs.
 - Applied plot, filter, and frequency settings are restored when returning to a workspace.
 - Frequency analysis contains FFT, Welch PSD, energy histograms, optional peak markers, and compact per-plot controls.
-- Summary plots contains binned mean curves with standard-deviation bands and per-experiment peak distributions.
+- Summary contains binned mean curves with standard-deviation bands and per-experiment peak distributions.
 - The IFF-friendly palette uses `#0075CF` as its primary accent and avoids red plot colors.
 - CSV files in `data` are ignored by Git so confidential work data is not accidentally committed.
 

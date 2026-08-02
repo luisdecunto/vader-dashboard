@@ -8,8 +8,14 @@ from vader_dashboard import (
     PHYSICS_CONTROL_SPECS,
     PhysicalSettings,
     VELOCITY_COLUMN,
+    WORKSPACE_DATA,
+    WORKSPACE_DEFINITIONS,
+    WORKSPACE_FREQUENCY,
+    WORKSPACE_POSTPROCESSING,
+    WORKSPACE_SUMMARY,
     column_axis_title,
     column_display_label,
+    normalize_workspace,
     parse_filter_formula,
     parse_filter_formula_list,
     parse_velocity_value,
@@ -38,6 +44,27 @@ class ExpertLayerRegistryTests(unittest.TestCase):
             [specification.ui_label for specification in FILTER_CONTROL_SPECS],
             ["MA", "LP", "HP", "SG", "WH", "Notch"],
         )
+
+
+class WorkspaceNavigationTests(unittest.TestCase):
+    def test_workspaces_follow_analysis_flow(self) -> None:
+        self.assertEqual(
+            [definition[0] for definition in WORKSPACE_DEFINITIONS],
+            [
+                WORKSPACE_DATA,
+                WORKSPACE_FREQUENCY,
+                WORKSPACE_POSTPROCESSING,
+                WORKSPACE_SUMMARY,
+            ],
+        )
+
+    def test_legacy_workspace_names_migrate(self) -> None:
+        self.assertEqual(
+            normalize_workspace("Filtered / processed"), WORKSPACE_DATA
+        )
+        self.assertEqual(normalize_workspace("Raw data"), WORKSPACE_DATA)
+        self.assertEqual(normalize_workspace("Summary plots"), WORKSPACE_SUMMARY)
+        self.assertEqual(normalize_workspace("unknown"), WORKSPACE_DATA)
 
 
 class DashboardDisplayTests(unittest.TestCase):

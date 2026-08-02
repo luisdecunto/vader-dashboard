@@ -1775,30 +1775,19 @@ def main() -> None:
         st.code(str(DATA_DIR), language="text")
         return
 
-    raw_content = st.empty()
-    processed_content = st.empty()
-    frequency_content = st.empty()
-    summary_content = st.empty()
-    if workspace == "Raw data":
-        with raw_content.container():
-            render_dashboard(
-                file_summary, signature, physical_settings,
-                "raw", RAW_AXIS_COLUMNS, RAW_DEFAULT_PLOTS,
-                allow_processing=False,
-            )
-    elif workspace == "Filtered / processed":
-        with processed_content.container():
-            render_dashboard(
-                file_summary, signature, physical_settings,
-                "processed", PROCESSED_AXIS_COLUMNS, PROCESSED_DEFAULT_PLOTS,
-                allow_processing=True,
-            )
-    elif workspace == "Frequency analysis":
-        with frequency_content.container():
-            render_frequency_workspace(file_summary, signature, physical_settings)
+    if workspace == WORKSPACE_DATA:
+        render_dashboard(
+            file_summary, signature, physical_settings,
+            "processed", PROCESSED_AXIS_COLUMNS, PROCESSED_DEFAULT_PLOTS,
+            allow_processing=True,
+        )
+    elif workspace == WORKSPACE_FREQUENCY:
+        render_frequency_workspace(file_summary, signature, physical_settings)
+    elif workspace == WORKSPACE_POSTPROCESSING:
+        render_postprocessing_workspace()
     else:
-        with summary_content.container():
-            render_summary_workspace(file_summary, signature, physical_settings)
+        render_summary_workspace(file_summary, signature, physical_settings)
+
 
 def inject_styles() -> None:
     st.markdown(
@@ -2136,24 +2125,42 @@ def render_header(workspace: str) -> None:
     )
 
 
+WORKSPACE_DATA = "Data"
+WORKSPACE_FREQUENCY = "Frequency analysis"
+WORKSPACE_POSTPROCESSING = "Postprocessing"
+WORKSPACE_SUMMARY = "Summary"
+WORKSPACE_DEFINITIONS = (
+    (WORKSPACE_DATA, ":material/show_chart:", "processed"),
+    (WORKSPACE_FREQUENCY, ":material/graphic_eq:", "frequency"),
+    (WORKSPACE_POSTPROCESSING, ":material/calculate:", "postprocessing"),
+    (WORKSPACE_SUMMARY, ":material/analytics:", "summary"),
+)
+LEGACY_WORKSPACE_NAMES = {
+    "Filtered / processed": WORKSPACE_DATA,
+    "Raw data": WORKSPACE_DATA,
+    "Summary plots": WORKSPACE_SUMMARY,
+}
+
+
+def normalize_workspace(workspace: object) -> str:
+    candidate = LEGACY_WORKSPACE_NAMES.get(str(workspace), str(workspace))
+    valid_names = {definition[0] for definition in WORKSPACE_DEFINITIONS}
+    return candidate if candidate in valid_names else WORKSPACE_DATA
+
+
 def set_workspace(workspace: str) -> None:
+    workspace = normalize_workspace(workspace)
     st.session_state["workspace"] = workspace
-    st.session_state["_restore_scope"] = {
-        "Filtered / processed": "processed",
-        "Raw data": "raw",
-        "Frequency analysis": "frequency",
-        "Summary plots": "summary",
-    }[workspace]
+    st.session_state["_restore_scope"] = next(
+        scope
+        for name, _, scope in WORKSPACE_DEFINITIONS
+        if name == workspace
+    )
 
 
 def render_navigation() -> str:
-    workspaces = [
-        ("Filtered / processed", ":material/auto_fix_high:"),
-        ("Raw data", ":material/table_chart:"),
-        ("Frequency analysis", ":material/graphic_eq:"),
-        ("Summary plots", ":material/analytics:"),
-    ]
-    current = st.session_state.get("workspace", "Filtered / processed")
+    current = normalize_workspace(st.session_state.get("workspace", WORKSPACE_DATA))
+    st.session_state["workspace"] = current
     with st.container(key="nav_rail"):
         st.markdown(
             f"""
@@ -2166,7 +2173,7 @@ def render_navigation() -> str:
             """,
             unsafe_allow_html=True,
         )
-        for label, icon in workspaces:
+        for label, icon, _ in WORKSPACE_DEFINITIONS:
             st.button(
                 label,
                 icon=icon,
@@ -2178,6 +2185,7 @@ def render_navigation() -> str:
                 args=(label,),
             )
     return current
+
 
 def render_physical_settings() -> PhysicalSettings:
     defaults = PhysicalSettings()
@@ -3681,6 +3689,11 @@ def submit_background_job(
 
 def make_job_key(*parts: Any) -> str:
     return hashlib.sha256(repr(parts).encode("utf-8")).hexdigest()
+
+
+def render_postprocessing_workspace() -> None:
+    st.info("Postprocessing workspace ready for feature extraction.")
+
 
 def restore_summary_controls(file_summary: pd.DataFrame) -> None:
     request = st.session_state.get("summary_applied_request")
