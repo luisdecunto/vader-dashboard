@@ -2641,9 +2641,9 @@ def render_plot_window(
 
         selector_scope = f"{scope}_{index}"
         group_widths = (
-            [1.45, 1, 1, 1.15]
+            [1, 1.1, 1.1, 1.15]
             if allow_processing
-            else [1.6, 1, 1.15]
+            else [1, 1.1, 1.15]
         )
         control_groups = st.columns(
             group_widths,
@@ -3792,7 +3792,7 @@ def render_summary_workspace(
     )
     st.session_state.setdefault("summary_group_by", "Material")
     st.session_state.setdefault("summary_bins", 100)
-    control_columns = st.columns([1.7, 1.7, 1.35, 0.8, 0.75], gap="small")
+    control_columns = st.columns([1.05, 1.05, 1.45, 0.85, 0.8], gap="small")
     with control_columns[0]:
         x_column = st.selectbox(
             "X axis",
