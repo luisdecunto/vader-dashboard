@@ -4,7 +4,7 @@ from dataclasses import fields, replace
 import numpy as np
 import pandas as pd
 
-from vader_dashboard import (
+from vader_dashboard_v2 import (
     DATA_PLOT_HEIGHT,
     DEFAULT_POSTPROCESSING_FORCE_FORMULA,
     DEFAULT_STRAIN_FORMULA,
@@ -28,9 +28,12 @@ from vader_dashboard import (
     WORKSPACE_FREQUENCY,
     WORKSPACE_POSTPROCESSING,
     WORKSPACE_SUMMARY,
+    append_custom_formula_text,
     column_axis_title,
     column_display_label,
     column_menu_label,
+    custom_expression_column,
+    formula_source_label,
     frequency_analysis_key,
     make_empty_plot_figure,
     make_postprocessing_figures,
@@ -41,6 +44,7 @@ from vader_dashboard import (
     parse_velocity_value,
     plot_analysis_key,
     sorted_velocity_values,
+    spectrum_axis_title,
 )
 
 
@@ -149,6 +153,19 @@ class WorkspaceNavigationTests(unittest.TestCase):
 
 
 class DashboardDisplayTests(unittest.TestCase):
+    def test_custom_formula_tokens_can_be_inserted_repeatedly(self) -> None:
+        expression = ""
+        for token, kind in (
+            ("A", "variable"),
+            ("/", "symbol"),
+            ("D", "variable"),
+            ("+", "symbol"),
+            ("A", "variable"),
+        ):
+            expression = append_custom_formula_text(expression, token, kind)
+
+        self.assertEqual(expression, "A / D + A")
+
     def test_velocities_are_parsed_and_sorted_numerically(self) -> None:
         self.assertEqual(parse_velocity_value("10mms"), 10.0)
         self.assertEqual(
@@ -165,6 +182,11 @@ class DashboardDisplayTests(unittest.TestCase):
         self.assertEqual(force_steps[0].operation, "lowpass")
         legacy_source, _ = parse_filter_formula("LP(HD,20)")
         self.assertEqual(legacy_source, "radial_Hencky_strain")
+        custom_column = custom_expression_column("A / D + F")
+        self.assertEqual(formula_source_label(custom_column), "Y")
+        custom_source, custom_steps = parse_filter_formula("LP(Y,20)")
+        self.assertEqual(custom_source, "Y")
+        self.assertEqual(custom_steps[0].operation, "lowpass")
         variants = parse_filter_formula_list(
             "HS; LP(HS,20)", "radial_Hencky_strain"
         )
@@ -286,6 +308,11 @@ class DashboardDisplayTests(unittest.TestCase):
         self.assertEqual(column_display_label("vertical_strain"), "ε_{z}")
         self.assertEqual(column_menu_label("vertical_strain"), "ε_{z}")
         self.assertIn("ε<sub>z</sub>", column_axis_title("vertical_strain"))
+        custom_column = custom_expression_column("A / D + F")
+        self.assertEqual(column_axis_title(custom_column), "A / D + F")
+        self.assertEqual(
+            spectrum_axis_title("FFT", custom_column), "|FFT(A / D + F)|"
+        )
         self.assertIn("[-]", column_axis_title("radial_Hencky_strain"))
         self.assertIn("mm s<sup>-1</sup>", column_axis_title(VELOCITY_COLUMN))
 

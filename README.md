@@ -42,16 +42,22 @@ streamlit run app.py
 
 The app sets its working directory to the folder containing `app.py`, then reads `data/*.csv`.
 
-## Standalone file
+## Standalone versions
 
-`vader_dashboard.py` contains the complete application, analysis code, styles,
-and embedded VADER icon. Place it beside the `data` folder and run:
+Both standalone files contain the complete application, analysis code, styles,
+and embedded VADER icon:
+
+- `vader_dashboard_v1.py` is the stable checkpoint restored from commit `73f1df7`.
+- `vader_dashboard_v2.py` is the current version with custom formulas available
+  in Data, Frequency analysis, and Postprocessing.
+
+Place either file beside the `data` folder and run the selected version:
 
 ```powershell
-streamlit run vader_dashboard.py
+streamlit run vader_dashboard_v2.py
 ```
 
-It still requires the packages listed in `requirements.txt` to be installed.
+Both versions require the packages listed in `requirements.txt` to be installed.
 
 ## One-file architecture
 
@@ -114,10 +120,13 @@ Select a filter, set its parameters, and press Add. The new filter wraps the
 existing formula. Remove peels off the outer filter and Reset returns to the
 selected signal. `LP` and `HP` use Hz; `MA` and `SG` windows use samples.
 
-## Custom Y formulas
+## Custom formulas
 
-The function button beside either Data Y selector opens a formula editor. Formulas
-can be typed directly or assembled from dropdowns. Available short names are:
+The function button beside a Data Y selector, the Frequency variable, or the
+Postprocessing Y selector opens the same formula editor. The formula remains
+fully editable by hand. Variable and symbol insertion controls can append any
+token repeatedly, while Wrap applies a selected function to the current formula.
+Numeric constants are typed directly. Available short names are:
 
 ```text
 t, Lv, HS, eps_z, D, D0, F, A, sig, sig_surf,

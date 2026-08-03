@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from vader_dashboard import (
+from vader_dashboard_v2 import (
     FilterSettings,
     PhysicalSettings,
     add_custom_expression_column,
@@ -90,6 +90,15 @@ class DerivedQuantityTests(unittest.TestCase):
         np.testing.assert_allclose(
             d0_and_surface_tension,
             derived["diameter_mm"] / derived["D_over_D0"] + 72.0 / np.pi,
+        )
+        repeated = evaluate_custom_expression(
+            derived, "A / D + A / D + sin(HS) + F", settings
+        )
+        np.testing.assert_allclose(
+            repeated,
+            2.0 * derived["area_mm2"] / derived["diameter_mm"]
+            + np.sin(derived["radial_Hencky_strain"])
+            + derived["force_g"],
         )
 
     def test_custom_y_expression_rejects_python_access(self) -> None:
@@ -203,6 +212,35 @@ class PostprocessingAnalysisTests(unittest.TestCase):
         self.assertAlmostEqual(result.window_starts["run.csv"][1], 2.0)
         self.assertAlmostEqual(result.window_starts["run.csv"][2], 1.0)
         self.assertEqual(result.windows["run.csv"].endpoint_index, 9)
+
+    def test_custom_y_expression_uses_processed_measurements(self) -> None:
+        time_s = np.arange(10, dtype=float)
+        frame = pd.DataFrame({
+            "source_file": "run.csv",
+            "time_from_onset_s": time_s,
+            "vertical_distance_L": time_s,
+            "radial_Hencky_strain": 0.5 * time_s,
+            "vertical_strain": 0.25 * time_s,
+            "D_over_D0": np.linspace(1.0, 0.5, time_s.size),
+            "force_g": 2.0 * time_s,
+            "diameter_mm": np.full(time_s.size, 2.0),
+            "velocity_mm_s": np.full(time_s.size, 5.0),
+        })
+        y_column = custom_expression_column("F + F")
+
+        result = analyze_postprocessing_runs(
+            frame,
+            FilterSettings(),
+            FilterSettings(),
+            y_column,
+            FilterSettings(),
+            PhysicalSettings(),
+            r2_threshold=0.999,
+            min_points=3,
+            epsilon_start=1.0,
+        )
+
+        np.testing.assert_allclose(result.frame[y_column], 4.0 * time_s)
 
 class SignalProcessingTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -446,6 +484,27 @@ class SignalProcessingTests(unittest.TestCase):
         )
         self.assertTrue(
             np.any(np.isclose(batch.results["run_b.csv"].peaks_hz, 7.0))
+        )
+
+    def test_frequency_analysis_accepts_custom_signal(self) -> None:
+        values = np.sin(2.0 * np.pi * 4.0 * self.time_s)
+        frame = pd.DataFrame({
+            "time_from_onset_s": self.time_s,
+            "force_g": values,
+            "source_file": "run.csv",
+        })
+        signal_column = custom_expression_column("F + F")
+        prepared = add_custom_expression_column(
+            frame, signal_column, PhysicalSettings()
+        )
+
+        batch = analyze_frequency_runs(
+            prepared, signal_column, FilterSettings(), 1.0, 8.0, 3, 12
+        )
+
+        self.assertFalse(batch.failures)
+        self.assertTrue(
+            np.any(np.isclose(batch.results["run.csv"].peaks_hz, 4.0))
         )
 
 
