@@ -7,6 +7,7 @@ or:
 """
 from __future__ import annotations
 
+import ast
 import re
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable
@@ -233,7 +234,7 @@ COLUMN_DISPLAY_LABELS = {
     "time_from_onset_s": "Time from onset",
     "vertical_distance_L": "Vertical distance",
     "radial_Hencky_strain": "HS strain",
-    "vertical_strain": "Vertical strain",
+    "vertical_strain": "ε_{z}",
     "D_over_D0": "D / D0",
     "force_g": "Force",
     "diameter_mm": "Diameter",
@@ -254,7 +255,7 @@ COLUMN_MENU_LABELS = {
     "time_from_onset_s": "t",
     "vertical_distance_L": "L\u1d65",
     "radial_Hencky_strain": "\u03b5\u1d63",
-    "vertical_strain": "\u03b5_z",
+    "vertical_strain": "\u03b5_{z}",
     "D_over_D0": "D/D\u2080",
     "force_g": "F",
     "diameter_mm": "D",
@@ -528,10 +529,14 @@ CustomFilterExecutor = Callable[
 CUSTOM_FILTER_EXECUTORS: dict[str, CustomFilterExecutor] = {}
 
 def column_display_label(column: str) -> str:
+    if is_custom_expression_column(column):
+        return custom_expression_text(column)
     return COLUMN_DISPLAY_LABELS.get(column, column)
 
 
 def column_menu_label(column: str) -> str:
+    if is_custom_expression_column(column):
+        return f"ƒ {custom_expression_text(column)}"
     return COLUMN_MENU_LABELS.get(column, column)
 
 
@@ -904,6 +909,181 @@ def _validated_step(operation: str, parameters: tuple[float, ...]) -> FilterStep
             raise ValueError("Invalid notch range, count, or Q value.")
         parameters = (minimum, maximum, float(int(count)), quality)
     return FilterStep(operation, parameters)
+
+CUSTOM_EXPRESSION_PREFIX = "__custom_y_expression__:"
+CUSTOM_EXPRESSION_COLUMNS = {
+    "t": "time_from_onset_s",
+    "Lv": "vertical_distance_L",
+    "HS": "radial_Hencky_strain",
+    "eps_z": "vertical_strain",
+    "D": "diameter_mm",
+    "F": "force_g",
+    "A": "area_mm2",
+    "sig": "stress_Pa",
+    "sig_surf": "surface_tension_stress_Pa",
+    "delta_sig": "net_stress_Pa",
+    "HS_rate": "hencky_strain_rate_1_s",
+    "visc_e": "extensional_viscosity_Pa_s",
+    "v": VELOCITY_COLUMN,
+}
+CUSTOM_EXPRESSION_TOKENS = (
+    *CUSTOM_EXPRESSION_COLUMNS,
+    "D0",
+    "pi",
+    "ST",
+)
+CUSTOM_EXPRESSION_FUNCTIONS = {
+    "abs": np.abs,
+    "sqrt": np.sqrt,
+    "log": np.log,
+    "log10": np.log10,
+    "exp": np.exp,
+    "sin": np.sin,
+    "cos": np.cos,
+    "minimum": np.minimum,
+    "maximum": np.maximum,
+}
+_CUSTOM_BINARY_OPERATORS = {
+    ast.Add: lambda left, right: left + right,
+    ast.Sub: lambda left, right: left - right,
+    ast.Mult: lambda left, right: left * right,
+    ast.Div: lambda left, right: left / right,
+    ast.Pow: lambda left, right: left**right,
+    ast.Mod: lambda left, right: left % right,
+}
+_CUSTOM_UNARY_OPERATORS = {
+    ast.UAdd: lambda value: value,
+    ast.USub: lambda value: -value,
+}
+
+
+def is_custom_expression_column(column: object) -> bool:
+    return str(column).startswith(CUSTOM_EXPRESSION_PREFIX)
+
+
+def custom_expression_text(column: object) -> str:
+    text = str(column)
+    return text[len(CUSTOM_EXPRESSION_PREFIX):] if is_custom_expression_column(text) else text
+
+
+def validate_custom_expression(expression: str) -> str:
+    text = str(expression).strip()
+    if not text:
+        raise ValueError("The Y formula cannot be empty.")
+    try:
+        tree = ast.parse(text, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError("The Y formula has invalid syntax.") from exc
+
+    def validate(node: ast.AST) -> None:
+        if isinstance(node, ast.Expression):
+            validate(node.body)
+        elif isinstance(node, ast.Constant):
+            if isinstance(node.value, bool) or not isinstance(node.value, (int, float)):
+                raise ValueError("Only numeric constants are allowed.")
+        elif isinstance(node, ast.Name):
+            if node.id not in CUSTOM_EXPRESSION_TOKENS:
+                raise ValueError(f"Unknown formula symbol '{node.id}'.")
+        elif isinstance(node, ast.BinOp) and type(node.op) in _CUSTOM_BINARY_OPERATORS:
+            validate(node.left)
+            validate(node.right)
+        elif isinstance(node, ast.UnaryOp) and type(node.op) in _CUSTOM_UNARY_OPERATORS:
+            validate(node.operand)
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id not in CUSTOM_EXPRESSION_FUNCTIONS:
+                raise ValueError(f"Unknown formula function '{node.func.id}'.")
+            if node.keywords:
+                raise ValueError("Formula functions do not accept named arguments.")
+            expected_arguments = 2 if node.func.id in {"minimum", "maximum"} else 1
+            if len(node.args) != expected_arguments:
+                raise ValueError(
+                    f"{node.func.id}() requires {expected_arguments} argument(s)."
+                )
+            for argument in node.args:
+                validate(argument)
+        else:
+            raise ValueError("The Y formula contains an unsupported operation.")
+
+    validate(tree)
+    return text
+
+
+def custom_expression_column(expression: str) -> str:
+    return CUSTOM_EXPRESSION_PREFIX + validate_custom_expression(expression)
+
+
+def evaluate_custom_expression(
+    data: pd.DataFrame,
+    expression: str,
+    settings: PhysicalSettings,
+) -> pd.Series:
+    text = validate_custom_expression(expression)
+
+    def values(column: str) -> np.ndarray:
+        if column not in data.columns:
+            raise ValueError(f"Formula input '{column}' is unavailable.")
+        return pd.to_numeric(data[column], errors="coerce").to_numpy(dtype=float)
+
+    namespace: dict[str, Any] = {
+        alias: values(column)
+        for alias, column in CUSTOM_EXPRESSION_COLUMNS.items()
+    }
+    diameter = namespace["D"]
+    diameter_ratio = values("D_over_D0")
+    namespace["D0"] = np.divide(
+        diameter,
+        diameter_ratio,
+        out=np.full(diameter.shape, np.nan, dtype=float),
+        where=np.isfinite(diameter_ratio) & (diameter_ratio != 0),
+    )
+    namespace["pi"] = np.pi
+    namespace["ST"] = float(settings.surface_tension_mN_m)
+    tree = ast.parse(text, mode="eval")
+
+    def calculate(node: ast.AST) -> Any:
+        if isinstance(node, ast.Expression):
+            return calculate(node.body)
+        if isinstance(node, ast.Constant):
+            return float(node.value)
+        if isinstance(node, ast.Name):
+            return namespace[node.id]
+        if isinstance(node, ast.BinOp):
+            return _CUSTOM_BINARY_OPERATORS[type(node.op)](
+                calculate(node.left), calculate(node.right)
+            )
+        if isinstance(node, ast.UnaryOp):
+            return _CUSTOM_UNARY_OPERATORS[type(node.op)](calculate(node.operand))
+        if isinstance(node, ast.Call):
+            function = CUSTOM_EXPRESSION_FUNCTIONS[node.func.id]
+            return function(*(calculate(argument) for argument in node.args))
+        raise ValueError("The Y formula contains an unsupported operation.")
+
+    with np.errstate(all="ignore"):
+        calculated = np.asarray(calculate(tree), dtype=float)
+    if calculated.ndim == 0:
+        calculated = np.full(len(data), float(calculated), dtype=float)
+    else:
+        try:
+            calculated = np.broadcast_to(calculated, (len(data),)).astype(float, copy=True)
+        except ValueError as exc:
+            raise ValueError("The Y formula did not produce one value per row.") from exc
+    calculated[~np.isfinite(calculated)] = np.nan
+    return pd.Series(calculated, index=data.index, name=custom_expression_column(text))
+
+
+def add_custom_expression_column(
+    data: pd.DataFrame,
+    column: str,
+    settings: PhysicalSettings,
+) -> pd.DataFrame:
+    if not is_custom_expression_column(column):
+        return data
+    result = data.copy()
+    result[column] = evaluate_custom_expression(
+        result, custom_expression_text(column), settings
+    )
+    return result
+
 
 @dataclass
 class ProcessedFrame:
@@ -2090,6 +2270,8 @@ def frequency_analysis_key(request: FrequencyRequest) -> tuple[Any, ...]:
 
 
 def column_axis_title(column: str) -> str:
+    if is_custom_expression_column(column):
+        return custom_expression_text(column)
     symbol = COLUMN_AXIS_SYMBOLS.get(column, column)
     unit = COLUMN_UNITS.get(column, "-")
     return f"{symbol} [{unit}]"
@@ -2984,32 +3166,200 @@ def render_plot_view_controls(
         normalize_axis_scale(str(y_scale)),
     )
 
+def _custom_formula_key(key_prefix: str, suffix: str) -> str:
+    return f"{key_prefix}_custom_y_{suffix}"
+
+
+def open_custom_y_formula(key_prefix: str) -> None:
+    state_key = f"{key_prefix}_y"
+    current = str(st.session_state.get(state_key, ""))
+    draft_key = _custom_formula_key(key_prefix, "draft")
+    if is_custom_expression_column(current):
+        st.session_state[draft_key] = custom_expression_text(current)
+    else:
+        st.session_state.setdefault(draft_key, "A / D")
+    st.session_state[_custom_formula_key(key_prefix, "error")] = ""
+    st.session_state["custom_y_dialog_scope"] = key_prefix
+
+
+def close_custom_y_formula() -> None:
+    st.session_state["custom_y_dialog_scope"] = None
+
+
+def apply_custom_y_formula(key_prefix: str) -> bool:
+    draft_key = _custom_formula_key(key_prefix, "draft")
+    error_key = _custom_formula_key(key_prefix, "error")
+    try:
+        column = custom_expression_column(st.session_state.get(draft_key, ""))
+    except ValueError as exc:
+        st.session_state[error_key] = str(exc)
+        return False
+    st.session_state[f"{key_prefix}_y"] = column
+    st.session_state[error_key] = ""
+    st.session_state["custom_y_dialog_scope"] = None
+    return True
+
+
+def build_custom_y_formula(key_prefix: str) -> None:
+    left = str(st.session_state[_custom_formula_key(key_prefix, "left")])
+    operation = str(st.session_state[_custom_formula_key(key_prefix, "operator")])
+    right = str(st.session_state[_custom_formula_key(key_prefix, "right")])
+    if right == "Number":
+        right = f"{float(st.session_state[_custom_formula_key(key_prefix, 'number')]):g}"
+    st.session_state[_custom_formula_key(key_prefix, "draft")] = (
+        f"{left} {operation} {right}"
+    )
+
+
+def wrap_custom_y_formula(key_prefix: str) -> None:
+    draft_key = _custom_formula_key(key_prefix, "draft")
+    function = str(st.session_state[_custom_formula_key(key_prefix, "function")])
+    current = str(st.session_state.get(draft_key, "")).strip() or "A / D"
+    st.session_state[draft_key] = f"{function}({current})"
+
+
+@st.dialog("Custom Y formula", width="large")
+def render_custom_y_formula_dialog(key_prefix: str) -> None:
+    draft_key = _custom_formula_key(key_prefix, "draft")
+    st.session_state.setdefault(draft_key, "A / D")
+    builder = st.columns(
+        [1.0, 0.65, 1.0, 0.72, 0.55],
+        gap="small",
+        vertical_alignment="bottom",
+    )
+    with builder[0]:
+        st.selectbox(
+            "Left",
+            CUSTOM_EXPRESSION_TOKENS,
+            index=CUSTOM_EXPRESSION_TOKENS.index("A"),
+            key=_custom_formula_key(key_prefix, "left"),
+        )
+    with builder[1]:
+        st.selectbox(
+            "Operator",
+            ["+", "-", "*", "/", "**"],
+            index=3,
+            key=_custom_formula_key(key_prefix, "operator"),
+        )
+    with builder[2]:
+        st.selectbox(
+            "Right",
+            (*CUSTOM_EXPRESSION_TOKENS, "Number"),
+            index=CUSTOM_EXPRESSION_TOKENS.index("D"),
+            key=_custom_formula_key(key_prefix, "right"),
+        )
+    with builder[3]:
+        st.number_input(
+            "Number",
+            value=1.0,
+            format="%.6g",
+            key=_custom_formula_key(key_prefix, "number"),
+        )
+    with builder[4]:
+        st.button(
+            "Use",
+            key=_custom_formula_key(key_prefix, "build"),
+            on_click=build_custom_y_formula,
+            args=(key_prefix,),
+            width="stretch",
+        )
+
+    function_row = st.columns(
+        [1.0, 0.55, 3.0], gap="small", vertical_alignment="bottom"
+    )
+    with function_row[0]:
+        st.selectbox(
+            "Function",
+            tuple(CUSTOM_EXPRESSION_FUNCTIONS),
+            key=_custom_formula_key(key_prefix, "function"),
+        )
+    with function_row[1]:
+        st.button(
+            "Wrap",
+            key=_custom_formula_key(key_prefix, "wrap"),
+            on_click=wrap_custom_y_formula,
+            args=(key_prefix,),
+            width="stretch",
+        )
+
+    st.text_area(
+        "Formula",
+        key=draft_key,
+        height=90,
+        help=(
+            "Symbols: t, Lv, HS, eps_z, D, D0, F, A, sig, sig_surf, "
+            "delta_sig, HS_rate, visc_e, v, pi, ST. ST uses mN/m."
+        ),
+    )
+    error = str(st.session_state.get(_custom_formula_key(key_prefix, "error"), ""))
+    if error:
+        st.error(error)
+    actions = st.columns([1.0, 1.0, 3.0], gap="small")
+    apply_clicked = actions[0].button(
+        "Apply",
+        type="primary",
+        key=_custom_formula_key(key_prefix, "apply"),
+        width="stretch",
+    )
+    cancel_clicked = actions[1].button(
+        "Cancel",
+        key=_custom_formula_key(key_prefix, "cancel"),
+        width="stretch",
+    )
+    if apply_clicked:
+        if apply_custom_y_formula(key_prefix):
+            st.rerun()
+        st.rerun(scope="fragment")
+    if cancel_clicked:
+        close_custom_y_formula()
+        st.rerun()
+
+
 def render_axis_selector(
     key_prefix: str,
     axis_name: str,
     axis_options: list[str],
 ) -> str:
+    custom_y_enabled = axis_name.upper() == "Y"
     row = st.columns(
-        [0.18, 1],
+        [0.18, 1, 0.25] if custom_y_enabled else [0.18, 1],
         gap="small",
         vertical_alignment="center",
     )
+    state_key = f"{key_prefix}_{axis_name.lower()}"
+    if state_key in st.session_state:
+        st.session_state[state_key] = normalize_axis_column(
+            st.session_state[state_key]
+        )
+    options = list(axis_options)
+    current = str(st.session_state.get(state_key, ""))
+    if is_custom_expression_column(current) and current not in options:
+        options.append(current)
+
     with row[0]:
         render_inline_label(f"{axis_name}:")
     with row[1]:
-        state_key = f"{key_prefix}_{axis_name.lower()}"
-        if state_key in st.session_state:
-            st.session_state[state_key] = normalize_axis_column(
-                st.session_state[state_key]
-            )
         selected = st.selectbox(
             f"{axis_name} axis",
-            axis_options,
+            options,
             index=None,
             key=state_key,
             label_visibility="collapsed",
             format_func=column_menu_label,
         )
+    if custom_y_enabled:
+        with row[2]:
+            st.button(
+                "",
+                icon=":material/functions:",
+                key=f"{key_prefix}_open_custom_y",
+                help="Define a custom Y formula",
+                on_click=open_custom_y_formula,
+                args=(key_prefix,),
+                width="stretch",
+            )
+        if st.session_state.get("custom_y_dialog_scope") == key_prefix:
+            render_custom_y_formula_dialog(key_prefix)
     return str(selected)
 
 def render_plot_window(
@@ -3216,6 +3566,13 @@ def render_plot_window(
                     st.caption(warning)
 
         raw_frame = derive_dataset(preprocessed.frame, applied_physics)
+        try:
+            raw_frame = add_custom_expression_column(
+                raw_frame, y_column, applied_physics
+            )
+        except ValueError as exc:
+            st.error(f"Custom Y formula failed: {exc}")
+            return
         raw_plot_frame = build_plot_frame(raw_frame, x_column, y_column)
         if raw_plot_frame.empty:
             st.info("No data matches the applied selection.")
@@ -3896,7 +4253,14 @@ def render_background_processed_plot(
                 y_scale=y_scale,
             )
             return
-        processed_plot_frame = build_plot_frame(result.frame, x_column, y_column)
+        try:
+            processed_frame = add_custom_expression_column(
+                result.frame, y_column, physical_settings
+            )
+        except ValueError as exc:
+            st.error(f"Custom Y formula failed: {exc}")
+            return
+        processed_plot_frame = build_plot_frame(processed_frame, x_column, y_column)
         if processed_plot_frame.empty:
             st.info("Processed data is empty for the current plot selection.")
             return

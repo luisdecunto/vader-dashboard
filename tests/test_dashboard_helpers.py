@@ -160,6 +160,9 @@ class DashboardDisplayTests(unittest.TestCase):
         source, steps = parse_filter_formula("LP(HS,20)")
         self.assertEqual(source, "radial_Hencky_strain")
         self.assertEqual(steps[0].operation, "lowpass")
+        force_source, force_steps = parse_filter_formula("LP(F,20)")
+        self.assertEqual(force_source, "force_g")
+        self.assertEqual(force_steps[0].operation, "lowpass")
         legacy_source, _ = parse_filter_formula("LP(HD,20)")
         self.assertEqual(legacy_source, "radial_Hencky_strain")
         variants = parse_filter_formula_list(
@@ -195,7 +198,7 @@ class DashboardDisplayTests(unittest.TestCase):
                 "t",
                 "L\u1d65",
                 "\u03b5\u1d63",
-                "\u03b5_z",
+                "\u03b5_{z}",
                 "D/D\u2080",
                 "F",
                 "D",
@@ -280,6 +283,9 @@ class DashboardDisplayTests(unittest.TestCase):
         self.assertEqual(column_display_label("radial_Hencky_strain"), "HS strain")
         self.assertEqual(column_display_label(VELOCITY_COLUMN), "Velocity")
         self.assertIn("ε<sub>r</sub>", column_axis_title("radial_Hencky_strain"))
+        self.assertEqual(column_display_label("vertical_strain"), "ε_{z}")
+        self.assertEqual(column_menu_label("vertical_strain"), "ε_{z}")
+        self.assertIn("ε<sub>z</sub>", column_axis_title("vertical_strain"))
         self.assertIn("[-]", column_axis_title("radial_Hencky_strain"))
         self.assertIn("mm s<sup>-1</sup>", column_axis_title(VELOCITY_COLUMN))
 

@@ -113,6 +113,24 @@ SG(LP(MA(force_g),20),31,3)
 Select a filter, set its parameters, and press Add. The new filter wraps the
 existing formula. Remove peels off the outer filter and Reset returns to the
 selected signal. `LP` and `HP` use Hz; `MA` and `SG` windows use samples.
+
+## Custom Y formulas
+
+The function button beside either Data Y selector opens a formula editor. Formulas
+can be typed directly or assembled from dropdowns. Available short names are:
+
+```text
+t, Lv, HS, eps_z, D, D0, F, A, sig, sig_surf,
+delta_sig, HS_rate, visc_e, v, pi, ST
+```
+
+`F` is also accepted anywhere `force_g` is accepted in processing formulas.
+`D0` is reconstructed as `D / (D/D0)`, and `ST` uses the Physics-panel surface
+tension value in mN/m. Supported functions are `abs`, `sqrt`, `log`, `log10`,
+`exp`, `sin`, `cos`, `minimum`, and `maximum`. Expressions are evaluated by a
+restricted parser; Python attributes, imports, indexing, and arbitrary function
+calls are rejected.
+
 ## Experiment preprocessing
 
 The Physics menu also controls the preprocessing applied before derived

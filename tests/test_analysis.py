@@ -6,7 +6,10 @@ import pandas as pd
 from vader_dashboard import (
     FilterSettings,
     PhysicalSettings,
+    add_custom_expression_column,
     add_derived_columns,
+    custom_expression_column,
+    evaluate_custom_expression,
     analyze_frequency,
     analyze_frequency_runs,
     analyze_postprocessing_runs,
@@ -59,6 +62,39 @@ class DerivedQuantityTests(unittest.TestCase):
         np.testing.assert_allclose(
             result["extensional_viscosity_Pa_s"], expected_net / 0.1
         )
+
+
+    def test_custom_y_expression_uses_scientific_aliases(self) -> None:
+        settings = PhysicalSettings(surface_tension_mN_m=72.0)
+        frame = pd.DataFrame({
+            "time_from_onset_s": [0.0, 1.0, 2.0],
+            "vertical_distance_L": [0.0, 0.1, 0.2],
+            "radial_Hencky_strain": [0.0, 0.2, 0.4],
+            "vertical_strain": [0.0, 0.1, 0.2],
+            "D_over_D0": [0.5, 0.4, 0.25],
+            "force_g": [1.0, 2.0, 3.0],
+            "diameter_mm": [2.0, 1.6, 1.0],
+            "velocity_mm_s": [5.0, 5.0, 5.0],
+            "source_file": ["run.csv"] * 3,
+        })
+        derived = add_derived_columns(frame, settings)
+        column = custom_expression_column("A / D")
+        result = add_custom_expression_column(derived, column, settings)
+
+        np.testing.assert_allclose(
+            result[column], derived["area_mm2"] / derived["diameter_mm"]
+        )
+        d0_and_surface_tension = evaluate_custom_expression(
+            derived, "D0 + ST / pi", settings
+        )
+        np.testing.assert_allclose(
+            d0_and_surface_tension,
+            derived["diameter_mm"] / derived["D_over_D0"] + 72.0 / np.pi,
+        )
+
+    def test_custom_y_expression_rejects_python_access(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unsupported operation"):
+            custom_expression_column("__import__('os').system('echo unsafe')")
 
 
 class LinearRangeTests(unittest.TestCase):
